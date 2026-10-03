@@ -1,0 +1,77 @@
+{
+  "_note": "Single source of truth for materials and surface presets. Read by the browser (synthesis, analytical preview) and by the backend (Allsolve model). SI units.",
+  "woodRatios": {
+    "_source": "Typical softwood/hardwood ratios to E_L (USDA Wood Handbook, ch. 5). x = grain (L), y = across boards (T), z = thickness (R).",
+    "ET": 0.05, "ER": 0.075, "GLR": 0.075, "GLT": 0.06, "GRT": 0.007,
+    "nuLR": 0.37, "nuLT": 0.42, "nuRT": 0.47
+  },
+  "_eta": "Loss factors are for built-up structures (joints, fixings, friction), not clear material.",
+  "materials": {
+    "pine":     { "name": "Pine",            "kind": "wood",      "rho": 500,  "E": 11.0e9,  "nu": 0.42, "eta": 0.035, "contact": 0.45 },
+    "spruce":   { "name": "Spruce (C24)",    "kind": "wood",      "rho": 420,  "E": 11.0e9,  "nu": 0.42, "eta": 0.035, "contact": 0.40 },
+    "oak":      { "name": "Oak",             "kind": "wood",      "rho": 700,  "E": 12.5e9,  "nu": 0.42, "eta": 0.030, "contact": 0.55 },
+    "larch":    { "name": "Larch",           "kind": "wood",      "rho": 590,  "E": 12.0e9,  "nu": 0.42, "eta": 0.035, "contact": 0.50 },
+    "steel":    { "name": "Structural steel","kind": "isotropic", "rho": 7850, "E": 210e9,   "nu": 0.30, "eta": 0.004, "contact": 1.00 },
+    "glass":    { "name": "Laminated glass", "kind": "isotropic", "rho": 2500, "E": 70e9,    "nu": 0.22, "eta": 0.020, "contact": 0.90 },
+    "concrete": { "name": "Concrete C30",    "kind": "isotropic", "rho": 2400, "E": 31e9,    "nu": 0.20, "eta": 0.020, "contact": 0.80 }
+  },
+  "floorSizes": {
+    "landing": { "name": "Landing", "Lx": 2.4, "Ly": 1.8 },
+    "room":    { "name": "Small room", "Lx": 3.6, "Ly": 3.0 }
+  },
+  "surfaces": [
+    {
+      "id": "pine-floor", "name": "Old pine floor", "blurb": "Boards on timber joists, the classic creaky house floor.",
+      "texture": "pine", "deck": { "material": "pine", "thickness": 0.022 },
+      "joists": { "material": "spruce", "width": 0.045, "height": 0.195, "spacing": 0.6 }
+    },
+    {
+      "id": "oak-floor", "name": "Oak hardwood", "blurb": "Dense oak on closely spaced joists. Tighter, warmer.",
+      "texture": "oak", "deck": { "material": "oak", "thickness": 0.020 },
+      "joists": { "material": "spruce", "width": 0.045, "height": 0.220, "spacing": 0.4 }
+    },
+    {
+      "id": "garden-deck", "name": "Garden deck", "blurb": "Thick larch boards outdoors. Hollow and open.",
+      "texture": "larch", "deck": { "material": "larch", "thickness": 0.028 },
+      "joists": { "material": "spruce", "width": 0.045, "height": 0.145, "spacing": 0.5 }
+    },
+    {
+      "id": "steel-catwalk", "name": "Steel catwalk", "blurb": "Thin steel plate on flat-bar beams. Rings for seconds.",
+      "texture": "steel", "deck": { "material": "steel", "thickness": 0.008 },
+      "joists": { "material": "steel", "width": 0.012, "height": 0.120, "spacing": 0.8 }
+    },
+    {
+      "id": "glass-walkway", "name": "Glass walkway", "blurb": "Laminated glass panel on steel beams.",
+      "texture": "glass", "deck": { "material": "glass", "thickness": 0.024 },
+      "joists": { "material": "steel", "width": 0.012, "height": 0.150, "spacing": 1.0 }
+    },
+    {
+      "id": "concrete-slab", "name": "Concrete slab", "blurb": "Solid 150 mm slab held on all edges. The control case.",
+      "texture": "concrete", "deck": { "material": "concrete", "thickness": 0.150 },
+      "joists": null
+    }
+  ],
+  "shoes": {
+    "heels":    { "name": "High heels",   "heelMs": 1.6,  "toeRatio": 0.25, "hardness": 1.00, "impulse": 0.3 },
+    "leather":  { "name": "Leather shoes","heelMs": 3.0,  "toeRatio": 0.35, "hardness": 0.80, "impulse": 0.22 },
+    "boots":    { "name": "Work boots",   "heelMs": 4.5,  "toeRatio": 0.45, "hardness": 0.65, "impulse": 0.26 },
+    "sneakers": { "name": "Sneakers",     "heelMs": 11.0, "toeRatio": 0.50, "hardness": 0.30, "impulse": 0.06 },
+    "barefoot": { "name": "Barefoot",     "heelMs": 18.0, "toeRatio": 0.60, "hardness": 0.15, "impulse": 0.03 }
+  },
+  "paces": {
+    "stroll": { "name": "Stroll", "cadence": 90,  "impact": 0.55 },
+    "walk":   { "name": "Walk",   "cadence": 110, "impact": 0.75 },
+    "brisk":  { "name": "Brisk",  "cadence": 125, "impact": 0.95 },
+    "run":    { "name": "Run",    "cadence": 165, "impact": 1.60 }
+  },
+  "_rooms": "Room echo presets. rt60 [s], wet send, pre-delay [ms], early reflections and discrete echoes as [ms, gain], hfDamp 0..1 (how fast highs die in the tail), flutter = repeating echo between parallel walls.",
+  "rooms": {
+    "normal":  { "name": "Normal room",  "rt60": 0.5,  "wet": 0.18, "predelayMs": 4,  "hfDamp": 0.5,  "early": [[7, 0.5], [13, 0.38], [21, 0.3], [29, 0.22]] },
+    "booth":   { "name": "Vocal booth",  "rt60": 0.12, "wet": 0.07, "predelayMs": 1,  "hfDamp": 0.9,  "early": [[2, 0.3], [4, 0.2]] },
+    "office":  { "name": "Office",       "rt60": 0.55, "wet": 0.16, "predelayMs": 5,  "hfDamp": 0.8,  "early": [[9, 0.4], [17, 0.3], [26, 0.2]] },
+    "outside": { "name": "Outside",      "rt60": 0.1,  "wet": 0.1,  "predelayMs": 0,  "hfDamp": 0.6,  "early": [[12, 0.25]], "echoes": [[140, 0.55], [290, 0.2]] },
+    "cave":    { "name": "Cave",         "rt60": 4.5,  "wet": 0.45, "predelayMs": 18, "hfDamp": 0.8,  "early": [[23, 0.4], [41, 0.35]], "echoes": [[180, 0.7], [320, 0.5], [510, 0.35], [760, 0.2]] },
+    "gym":     { "name": "Gymnasium",    "rt60": 2.0,  "wet": 0.35, "predelayMs": 10, "hfDamp": 0.2,  "early": [[15, 0.5], [28, 0.4]], "flutter": { "ms": 45, "g": 0.6, "n": 14, "decay": 0.82 } },
+    "church":  { "name": "Church",       "rt60": 3.5,  "wet": 0.4,  "predelayMs": 25, "hfDamp": 0.65, "early": [[31, 0.45], [47, 0.4], [66, 0.3], [88, 0.25]] }
+  }
+}

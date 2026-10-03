@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ModalForge · Footstep Lab</title>
+  <meta name="description" content="Physically simulated footstep sounds. Floor vibration computed with Quanscient Allsolve.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141922'/%3E%3Cpath d='M4 20c3-8 5-8 8 0s5 8 8 0 5-8 8 0' stroke='%23E0874A' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <a class="skip" href="#stage">Skip to floor</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><path d="M3 20c3-9 5-9 8 0s5 9 8 0 5-9 8 0" /></svg>
+      </span>
+      <span class="brand-name">ModalForge</span>
+      <span class="brand-sub">Footstep lab</span>
+    </div>
+    <p class="topbar-claim">Footsteps you can hear the physics in. Floor vibration solved by <strong>Quanscient Allsolve</strong>.</p>
+    <div class="topbar-actions">
+      <button class="status-pill" id="statusPill" type="button" aria-haspopup="dialog">
+        <span class="dot" aria-hidden="true"></span><span id="statusText">Checking Allsolve…</span>
+      </button>
+      <button class="btn ghost" id="tourBtn" type="button">How it works</button>
+      <button class="btn ghost icon" id="themeBtn" type="button" aria-label="Switch light or dark theme" title="Light / dark">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ============ LEFT: physics inputs (a true sequence) ============ -->
+    <aside class="rail rail-left" aria-label="Floor setup">
+      <section class="step" id="stepSurface">
+        <header class="step-head"><span class="step-no">1</span><h2>Choose a surface</h2></header>
+        <div class="surface-grid" id="surfaceGrid" role="radiogroup" aria-label="Surface"></div>
+      </section>
+
+      <section class="step" id="stepFloor">
+        <header class="step-head"><span class="step-no">2</span><h2>Shape the floor</h2></header>
+
+        <div class="field">
+          <span class="label">Floor size</span>
+          <div class="seg" id="sizeSeg" role="radiogroup" aria-label="Floor size presets"></div>
+        </div>
+
+        <label class="field">
+          <span class="label">Width <output id="widthOut" class="val"></output></span>
+          <input type="range" id="floorWidth" min="1" max="6" step="0.1">
+        </label>
+
+        <label class="field">
+          <span class="label">Depth <output id="depthOut" class="val"></output></span>
+          <input type="range" id="floorDepth" min="1" max="5" step="0.1">
+          <span class="hint">Bigger floors have lower, denser modes: deeper and boomier.</span>
+        </label>
+
+        <label class="field">
+          <span class="label">Deck material</span>
+          <select id="deckMaterial"></select>
+        </label>
+
+        <label class="field">
+          <span class="label">Deck thickness <output id="thicknessOut" class="val"></output></span>
+          <input type="range" id="thickness" min="4" max="60" step="1">
+          <span class="hint">Thicker boards are stiffer: higher, shorter tones.</span>
+        </label>
+
+        <label class="field" id="spacingField">
+          <span class="label">Joist spacing <output id="spacingOut" class="val"></output></span>
+          <input type="range" id="spacing" min="30" max="110" step="5">
+          <span class="hint">Distance between the beams under the floor. Wider spacing sounds boomier.</span>
+        </label>
+      </section>
+
+      <section class="step" id="stepSim">
+        <header class="step-head"><span class="step-no">3</span><h2>Run the physics</h2></header>
+        <p class="step-copy" id="simCopy">The preview uses a textbook estimate. Run Allsolve to solve the real 3D floor: boards, joists and supports together.</p>
+        <button class="btn primary wide" id="simBtn" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14c2-6 4-6 6 0s4 6 6 0 3-5 4-2"/></svg>
+          <span id="simBtnText">Simulate with Allsolve</span>
+        </button>
+        <label class="check"><input type="checkbox" id="freshRun"> Ignore saved result and solve again</label>
+
+        <div class="job" id="jobPanel" hidden>
+          <ol class="job-stages" id="jobStages">
+            <li data-stage="geometry">Geometry</li>
+            <li data-stage="mesh">Mesh</li>
+            <li data-stage="solve">Eigenmode solve</li>
+            <li data-stage="results">Results</li>
+          </ol>
+          <div class="job-bar"><span id="jobBar"></span></div>
+          <div class="job-meta"><span id="jobStage">Queued</span><span id="jobTime" class="mono">0:00</span></div>
+          <pre class="job-log" id="jobLog" aria-live="polite"></pre>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ============ CENTRE: the floor ============ -->
+    <section class="stage" id="stage" aria-label="Floor">
+      <div class="stage-bar">
+        <div class="seg" role="radiogroup" aria-label="Pointer mode" id="toolSeg">
+          <button type="button" role="radio" data-tool="step" aria-checked="true">Step</button>
+          <button type="button" role="radio" data-tool="path" aria-checked="false">Draw a path</button>
+        </div>
+        <div class="seg" role="radiogroup" aria-label="Floor overlay" id="overlaySeg">
+          <button type="button" role="radio" data-overlay="vibration" aria-checked="true">Live vibration</button>
+          <button type="button" role="radio" data-overlay="loudness" aria-checked="false">Loudness map</button>
+        </div>
+        <div class="stage-actions">
+          <button class="btn ghost" id="clearPathBtn" type="button">Clear path</button>
+          <button class="btn ghost toggle" id="varyBtn" type="button" aria-pressed="true" title="Every walk sounds a little different (timing, foot placement, strike). Off: the same path gives the same walk every time.">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h4l10 10h4M3 17h4L17 7h4m-3-3 3 3-3 3m0 4 3 3-3 3"/></svg><span>Vary</span>
+          </button>
+          <button class="btn ghost toggle" id="loopBtn" type="button" aria-pressed="false" title="Keep walking the path until you press Stop">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a6 6 0 0 1 6-6h8m-3-3 3 3-3 3M20 12a6 6 0 0 1-6 6H6m3 3-3-3 3-3"/></svg><span>Loop</span>
+          </button>
+          <button class="btn primary" id="walkBtn" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4l12 8-12 8z"/></svg><span id="walkBtnText">Walk</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="floor-wrap">
+        <canvas id="floor" aria-label="Floor plan. Click to take a step."></canvas>
+        <div class="source-badge" id="sourceBadge"><span class="dot"></span><span id="sourceText">Analytical preview</span></div>
+        <p class="floor-hint" id="floorHint">Click to step · drag the headphones to move · drag the teal dot or press Q/E to turn</p>
+        <div class="legend" id="legend" hidden>
+          <span id="legendLo"></span><span class="legend-ramp" id="legendRamp"></span><span id="legendHi"></span>
+        </div>
+      </div>
+
+      <div class="modes">
+        <div class="modes-head">
+          <h3>Vibration modes</h3>
+          <span class="hint" id="modesHint">Each mode is one way the floor can ring. Click one to see it and hear it alone.</span>
+        </div>
+        <div class="mode-strip" id="modeStrip" role="list"></div>
+      </div>
+    </section>
+
+    <!-- ============ RIGHT: listening & export (instant, no re-simulation) ============ -->
+    <aside class="rail rail-right" aria-label="Listen and export">
+      <section class="panel" id="walkerPanel">
+        <h2 class="panel-title">Walker</h2>
+        <div class="field">
+          <span class="label">Footwear</span>
+          <div class="chips" id="shoeChips" role="radiogroup" aria-label="Footwear"></div>
+        </div>
+        <div class="field">
+          <span class="label">Pace</span>
+          <div class="seg" id="paceSeg" role="radiogroup" aria-label="Pace"></div>
+        </div>
+        <label class="field">
+          <span class="label">Body mass <output id="massOut" class="val"></output></span>
+          <input type="range" id="mass" min="20" max="140" step="1" value="75">
+        </label>
+        <div class="field">
+          <span class="label">Room echo</span>
+          <div class="chips" id="roomChips" role="radiogroup" aria-label="Room echo"></div>
+        </div>
+        <div class="field">
+          <span class="label">Output</span>
+          <div class="seg" id="outputSeg" role="radiogroup" aria-label="Output"></div>
+          <span class="hint" id="outputHint"></span>
+        </div>
+        <label class="field">
+          <span class="label">Playback volume <output id="volumeOut" class="val"></output></span>
+          <input type="range" id="volume" min="0" max="24" step="1" value="12">
+          <span class="hint">Speaker level only. Exports and relative loudness between floors stay unchanged.</span>
+        </label>
+      </section>
+
+      <section class="panel" id="soundPanel">
+        <h2 class="panel-title">Last sound</h2>
+        <canvas id="wave" class="wave" aria-label="Waveform of the last sound"></canvas>
+        <canvas id="spectrum" class="spectrum" aria-label="Which modes rang, by frequency"></canvas>
+        <ol class="step-list" id="stepList" aria-label="Steps of the last walk" hidden></ol>
+        <dl class="readouts">
+          <div title="Unweighted peak sound pressure at the listener"><dt>Peak SPL</dt><dd id="roLevel">–</dd></div>
+          <div><dt>Ring time</dt><dd id="roRing">–</dd></div>
+          <div><dt>Lowest mode</dt><dd id="roLow">–</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel" id="exportPanel">
+        <h2 class="panel-title">Export</h2>
+        <div class="export-list">
+          <button class="btn export" id="dlWalk" type="button"><b>Walk</b><span id="dlWalkSub">WAV in the current output format</span></button>
+          <button class="btn export" id="dlStep" type="button"><b>Single step</b><span>WAV at the last step position</span></button>
+          <button class="btn export" id="dlSteps" type="button"><b>Walk, step by step</b><span>Every step as its own WAV · ZIP</span></button>
+          <button class="btn export" id="dlPack" type="button"><b>Game engine pack</b><span>Unity / Unreal: 4 paces × 10 mono one-shots, loop, manifest · ZIP</span></button>
+          <button class="btn export" id="dlModes" type="button"><b>Mode data</b><span>JSON for game engines</span></button>
+        </div>
+        <label class="check"><input type="checkbox" id="normalize"> Normalize exports to −1 dBFS</label>
+      </section>
+
+      <section class="panel check-panel" id="checkPanel">
+        <h2 class="panel-title">Physics check</h2>
+        <dl class="check-list" id="checkList"></dl>
+      </section>
+    </aside>
+  </main>
+
+  <!-- ============ API key dialog ============ -->
+  <dialog class="dialog" id="keyDialog" aria-labelledby="keyTitle">
+    <form method="dialog" class="dialog-inner">
+      <header class="dialog-head">
+        <h2 id="keyTitle">Connect Allsolve</h2>
+        <button class="btn ghost icon" value="close" aria-label="Close">✕</button>
+      </header>
+      <dl class="key-status" id="keyStatus"></dl>
+      <ol class="key-steps">
+        <li>In the Allsolve web app, open <b>Settings → Organization → API keys</b> and press <b>Create key</b>.</li>
+        <li>Open the <code>.env</code> file in the ModalForge folder and paste the access key and secret key:
+          <pre class="env-sample">ALLSOLVE_ACCESS_KEY=…
+ALLSOLVE_SECRET_KEY=…
+ALLSOLVE_HOST=https://allsolve.quanscient.com/</pre>
+          <span class="hint" id="envPath"></span>
+        </li>
+        <li>Save the file and press <b>Reload keys</b>. No restart needed.</li>
+      </ol>
+      <p class="hint">Keys stay in <code>.env</code> on the server and never reach the browser. The file is git-ignored.</p>
+      <p class="key-result" id="keyResult" role="status"></p>
+      <footer class="dialog-foot">
+        <button class="btn ghost" type="button" id="reloadKeysBtn">Reload keys</button>
+        <button class="btn primary" type="button" id="testKeysBtn">Test connection</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- ============ tour ============ -->
+  <div class="tour" id="tour" hidden>
+    <div class="tour-card" role="dialog" aria-live="polite" aria-labelledby="tourTitle">
+      <p class="tour-count" id="tourCount"></p>
+      <h3 id="tourTitle"></h3>
+      <p id="tourBody"></p>
+      <div class="tour-foot">
+        <button class="btn ghost" type="button" id="tourSkip">Skip</button>
+        <button class="btn primary" type="button" id="tourNext">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
