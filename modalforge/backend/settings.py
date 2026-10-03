@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -33,6 +34,8 @@ class Credentials:
         self.access_key = (values.get("ALLSOLVE_ACCESS_KEY") or "").strip()
         self.secret_key = (values.get("ALLSOLVE_SECRET_KEY") or "").strip()
         self.host = (values.get("ALLSOLVE_HOST") or DEFAULT_HOST).strip()
+        # Allsolve CPU node for mesh + solve; the process environment wins over .env
+        self.node_type = (os.environ.get("MODALFORGE_NODE_TYPE") or values.get("MODALFORGE_NODE_TYPE") or "").strip()
 
     @property
     def configured(self) -> bool:

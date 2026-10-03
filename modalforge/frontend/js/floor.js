@@ -83,6 +83,8 @@ export class FloorView {
     this.selectedMode = null;
     this.loudness = null;
     this.visShapes = null;
+    this.debris = null;       // { sprite, amount, bits: [{x, y, s, rot, v}] } loose material drawn on the floor
+    this.debrisLayer = null;
     this.drag = null;
     this.field = document.createElement("canvas");
     this.field.width = VIS_NX; this.field.height = VIS_NY;
@@ -116,7 +118,57 @@ export class FloorView {
     });
     this.excitations = [];
     this.loudness = null;
+    if (this.debris) this.setDebris(this.debris.sprite, this.debris.amount);
     this._layout();
+  }
+
+  /** Scatter loose material over the floor (sprite: shards, stones, sand, leaves, snow; null clears it). */
+  setDebris(sprite, amount = 0.6) {
+    if (!sprite || amount <= 0) { this.debris = null; this.debrisLayer = null; return; }
+    if (!this.model) { this.debris = { sprite, amount, bits: [] }; return; } // scattered once the floor exists
+    const { Lx, Ly } = this.model.spec;
+    const perM2 = { shards: 70, stones: 160, sand: 1400, leaves: 45, snow: 500 }[sprite] ?? 80;
+    const rng = mulberry32(sprite.length * 7919 + 3);
+    const n = Math.round(perM2 * Lx * Ly * amount);
+    const bits = Array.from({ length: n }, () => ({ x: rng() * Lx, y: rng() * Ly, s: rng(), rot: rng() * Math.PI * 2, v: rng() }));
+    this.debris = { sprite, amount, bits };
+    this._paintDebris();
+  }
+
+  _paintDebris() {
+    if (!this.debris || !this.texture) { this.debrisLayer = null; return; }
+    const { sprite, amount, bits } = this.debris, s = this.scale, Ly = this.model.spec.Ly;
+    const c = this.debrisLayer || document.createElement("canvas");
+    c.width = this.texture.width; c.height = this.texture.height;
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (sprite === "sand") { ctx.fillStyle = `rgba(214,186,130,${0.35 * amount})`; ctx.fillRect(0, 0, c.width, c.height); }
+    if (sprite === "snow") { ctx.fillStyle = `rgba(240,245,250,${0.55 * amount})`; ctx.fillRect(0, 0, c.width, c.height); }
+    for (const b of bits) {
+      const px = b.x * s, py = (Ly - b.y) * s;
+      ctx.save(); ctx.translate(px, py); ctx.rotate(b.rot);
+      if (sprite === "shards") {
+        const r = (0.008 + 0.02 * b.s) * s;
+        ctx.fillStyle = `rgba(${200 + 40 * b.v},240,250,0.55)`; ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(-r, -r * 0.3); ctx.lineTo(r * (0.4 + 0.6 * b.v), -r * 0.6); ctx.lineTo(r * 0.2, r * 0.7); ctx.closePath(); ctx.fill(); ctx.stroke();
+      } else if (sprite === "stones") {
+        const r = (0.006 + 0.014 * b.s * b.s) * s, g = 105 + 70 * b.v;
+        ctx.fillStyle = `rgb(${g},${g - 6},${g - 14})`; ctx.beginPath(); ctx.ellipse(0, 0, r, r * 0.72, 0, 0, 7); ctx.fill();
+        ctx.fillStyle = "rgba(255,255,255,0.25)"; ctx.beginPath(); ctx.ellipse(-r * 0.3, -r * 0.25, r * 0.4, r * 0.25, 0, 0, 7); ctx.fill();
+      } else if (sprite === "sand") {
+        const r = Math.max(0.6, (0.0015 + 0.002 * b.s) * s), g = 170 + 50 * b.v;
+        ctx.fillStyle = `rgba(${g},${g - 30},${g - 85},0.8)`; ctx.fillRect(-r / 2, -r / 2, r, r);
+      } else if (sprite === "leaves") {
+        const r = (0.025 + 0.03 * b.s) * s;
+        ctx.fillStyle = `rgba(${150 + 60 * b.v},${80 + 40 * b.v},30,0.85)`; ctx.beginPath(); ctx.ellipse(0, 0, r, r * 0.45, 0, 0, 7); ctx.fill();
+        ctx.strokeStyle = "rgba(70,35,10,0.6)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(-r, 0); ctx.lineTo(r, 0); ctx.stroke();
+      } else {
+        const r = (0.01 + 0.025 * b.s) * s;
+        ctx.fillStyle = "rgba(255,255,255,0.35)"; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+      }
+      ctx.restore();
+    }
+    this.debrisLayer = c;
   }
 
   setLoudness(grid) { this.loudness = grid; }
@@ -142,6 +194,7 @@ export class FloorView {
     tex.width = Math.max(1, Math.round(Lx * s)); tex.height = Math.max(1, Math.round(Ly * s));
     drawTexture(tex.getContext("2d"), this.textureKind, tex.width, tex.height, s);
     this.texture = tex;
+    this._paintDebris();
   }
 
   toPx(x, y) { return [this.ox + x * this.scale, this.oy + (this.model.spec.Ly - y) * this.scale]; }
@@ -212,6 +265,19 @@ export class FloorView {
     if (this.excitations.length > 6) this.excitations.shift();
     this.footprints.push({ x, y, t0: performance.now() / 1000, side, angle });
     if (this.footprints.length > 40) this.footprints.shift();
+    // the step pushes loose material aside
+    if (this.debris) {
+      const R = 0.16, { Lx, Ly } = this.model.spec;
+      let moved = false;
+      for (const b of this.debris.bits) {
+        const dx = b.x - x, dy = b.y - y, dist = Math.hypot(dx, dy);
+        if (dist > R) continue;
+        const push = (R - dist) * 0.35 * (0.5 + b.v) / Math.max(dist, 0.01);
+        b.x = Math.min(Lx, Math.max(0, b.x + dx * push)); b.y = Math.min(Ly, Math.max(0, b.y + dy * push));
+        b.rot += (b.v - 0.5) * 0.8; moved = true;
+      }
+      if (moved) this._paintDebris();
+    }
   }
 
   clearPath() { this.path = []; this.h.onPathChange?.(this.path); }
@@ -230,6 +296,7 @@ export class FloorView {
     ctx.fillStyle = "#000"; ctx.fillRect(x0, y0, fw, fh);
     ctx.restore();
     ctx.drawImage(this.texture, x0, y0, fw, fh);
+    if (this.debrisLayer) ctx.drawImage(this.debrisLayer, x0, y0, fw, fh);
 
     // overlay field
     let fieldDrawn = false;

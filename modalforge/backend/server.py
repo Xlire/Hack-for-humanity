@@ -10,18 +10,19 @@ import threading
 import time
 import traceback
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .model import ROOT, build_spec
+from .model import QUALITY, RESULTS_DIR, ROOT, build_spec
 from .settings import SDK_AVAILABLE, credentials, make_client
 
 FRONTEND = ROOT / "frontend"
 CACHE = ROOT / "cache"
-RESULTS = CACHE / "results"
+RESULTS = RESULTS_DIR
 RESULTS.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="ModalForge", docs_url="/api/docs")
@@ -76,11 +77,9 @@ def start_simulation(req: dict):
         raise HTTPException(400, str(exc))
 
     key = spec.cache_key()
-    cached = RESULTS / f"{key}.json"
-    if cached.exists() and not req.get("fresh"):
-        result = json.loads(cached.read_text(encoding="utf-8"))
-        result.setdefault("meta", {})["fromCache"] = True
-        return {"status": "done", "key": key, "result": result}
+    cached = spec.cached_result_file()
+    if cached and not req.get("fresh"):
+        return {"status": "done", "key": key, "result": _load(cached)}
 
     if not SDK_AVAILABLE:
         raise HTTPException(503, "The allsolve Python package is not installed on the server.")
@@ -93,8 +92,8 @@ def start_simulation(req: dict):
                 return {"status": "running", "jobId": jid, "key": key}
         job_id = uuid.uuid4().hex[:10]
         _jobs[job_id] = {
-            "status": "running", "key": key, "stage": "Queued", "progress": 0.0,
-            "logs": [], "startedAt": time.time(), "result": None, "error": None,
+            "status": "running", "key": key, "stage": "Queued", "progress": 0.0, "quality": spec.quality,
+            "logs": [], "startedAt": time.time(), "result": None, "error": None, "timings": {},
         }
     threading.Thread(target=_run_job, args=(job_id, spec), daemon=True).start()
     return {"status": "running", "jobId": job_id, "key": key}
@@ -102,17 +101,27 @@ def start_simulation(req: dict):
 
 @app.post("/api/lookup")
 def lookup(req: dict):
-    """Saved Allsolve result for this exact floor, if one exists. Never starts a cloud job."""
+    """Saved Allsolve result for this exact floor, if one exists. Never starts a cloud job.
+    With anyQuality, falls back to the most detailed preset saved for the same floor."""
     try:
         spec = build_spec(req)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    cached = RESULTS / f"{spec.cache_key()}.json"
-    if not cached.exists():
-        raise HTTPException(404, "No saved result")
-    result = json.loads(cached.read_text(encoding="utf-8"))
-    result.setdefault("meta", {})["fromCache"] = True
-    return {"key": spec.cache_key(), "result": result}
+    order = [spec.quality] + ([q for q in reversed(QUALITY) if q != spec.quality] if req.get("anyQuality") else [])
+    for q in order:
+        alt = replace(spec, quality=q)
+        cached = alt.cached_result_file()
+        if cached:
+            return {"key": alt.cache_key(), "quality": q, "result": _load(cached)}
+    raise HTTPException(404, "No saved result")
+
+
+def _load(path: Path) -> dict:
+    result = json.loads(path.read_text(encoding="utf-8"))
+    meta = result.setdefault("meta", {})
+    meta["fromCache"] = True
+    meta.setdefault("quality", "fine")  # v1 files: 100 modes, mesh for 2.5 kHz, 12 x 8 probes
+    return result
 
 
 @app.get("/api/simulations/{job_id}")
@@ -123,6 +132,7 @@ def job_status(job_id: str):
     return {
         "status": job["status"], "stage": job["stage"], "progress": round(job["progress"], 3),
         "logs": job["logs"][-14:], "elapsedS": round(time.time() - job["startedAt"], 1),
+        "timings": job["timings"], "quality": job["quality"],
         "result": job["result"], "error": job["error"],
     }
 
@@ -133,8 +143,12 @@ def list_results():
     for f in sorted(RESULTS.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:30]:
         try:
             r = json.loads(f.read_text(encoding="utf-8"))
-            items.append({"key": f.stem, "spec": r.get("spec"), "computedAt": r.get("meta", {}).get("computedAt"),
-                          "modes": len(r.get("modes", []))})
+            meta = r.get("meta", {})
+            items.append({"key": f.stem, "spec": r.get("spec"), "computedAt": meta.get("computedAt"),
+                          "modes": len(r.get("modes", [])), "variant": meta.get("variant", "floor"),
+                          "quality": meta.get("quality", "fine"), "timings": meta.get("timings"),
+                          "meshScale": meta.get("meshScale", 1.0), "meshMaxSize": meta.get("meshMaxSize"),
+                          "simulationId": meta.get("simulationId")})
         except Exception:
             continue
     return items
@@ -154,9 +168,12 @@ def _run_job(job_id: str, spec) -> None:
     try:
         if _run_lock.locked():
             progress("Waiting for the previous run to finish", 0.0, None)
+        t_wait = time.time()
         with _run_lock:
-            result = run_floor_modes(spec, progress, CACHE)
-        (RESULTS / f"{spec.cache_key()}.json").write_text(json.dumps(result), encoding="utf-8")
+            if time.time() - t_wait > 1:
+                job["timings"]["wait_local"] = round(time.time() - t_wait, 1)
+            result = run_floor_modes(spec, progress, CACHE, job["timings"])
+        spec.result_file().write_text(json.dumps(result), encoding="utf-8")
         job["result"] = result
         job["status"] = "done"
     except Exception as exc:

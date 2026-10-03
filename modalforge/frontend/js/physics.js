@@ -171,7 +171,10 @@ export function buildModel(cat, solved) {
     const fr = m.f / P.fc;
     const s = (fr * fr) / (1 + fr * fr) + 0.02; // radiation efficiency ramp toward coincidence
     const R = Math.sqrt(V * V + s * S * A);    // effective radiating area [m²]
-    return { f: m.f, shape: m.shape, Q: 1 / eta, mass: mk, R, tag: m.tag, grid: m.grid };
+    // Share of the mode's kinetic energy carried by the joists. The analytic model holds bay modes on
+    // rigid joists (share 0); a FEM mode with a large share is deck and joists moving together.
+    const joistShare = joistMass / mk;
+    return { f: m.f, shape: m.shape, Q: 1 / eta, mass: mk, R, tag: m.tag, grid: m.grid, joistShare };
   });
 
   return {
@@ -182,10 +185,31 @@ export function buildModel(cat, solved) {
   };
 }
 
-/** Physics check: lowest mode of the first deck bay / slab, analytic vs. the active result. */
-export function crossCheck(cat, model) {
-  const est = analyticModes(cat, model.spec);
-  const f1 = model.modes.length ? model.modes[0].f : NaN;
+export const COUPLED_SHARE = 0.2; // joist energy share above which a mode counts as deck + joists together
+export const DIVERGE = 0.15;      // |FEM / analytic − 1| above which a mode pair is marked as diverging
+
+/** Physics check: the active result against the textbook estimate for the same floor, mode by mode.
+ *  Pairs are by rank (k-th solved mode with k-th analytic mode). Rank pairing tolerates the
+ *  degenerate bay modes of the rigid-joist model, which a 3D solve splits into close neighbours.
+ *  Analytic modes appended above the solved band are left out: they would compare with themselves.
+ *  fem / analytic / diff keep describing the lowest mode, as before. */
+export function crossCheck(cat, model, est = analyticModes(cat, model.spec)) {
+  const solved = model.modes.filter((m) => m.tag !== "analytic-ext");
+  const pairs = solved.slice(0, est.modes.length).map((m, k) => ({
+    k: k + 1, fem: m.f, analytic: est.modes[k].f, diff: m.f / est.modes[k].f - 1,
+    joistShare: m.joistShare ?? 0, coupled: (m.joistShare ?? 0) > COUPLED_SHARE,
+  }));
+  const f1 = solved.length ? solved[0].f : NaN;
   const a1 = est.modes.length ? est.modes[0].f : NaN;
-  return { fem: f1, analytic: a1, diff: (f1 - a1) / a1 };
+  const absDiffs = pairs.map((p) => Math.abs(p.diff)).sort((a, b) => a - b);
+  // Mode density: how many modes each model puts below the top of the solved band. Rigid-joist bays
+  // repeat every bay mode once per bay, so the textbook model can be far denser than the coupled 3D floor.
+  const fTop = solved.length ? solved[solved.length - 1].f : NaN;
+  return {
+    fem: f1, analytic: a1, diff: (f1 - a1) / a1, pairs,
+    fTop, femBelowTop: solved.length, analyticBelowTop: est.modes.filter((m) => m.f <= fTop).length,
+    medianAbsDiff: absDiffs.length ? absDiffs[absDiffs.length >> 1] : NaN,
+    diverging: pairs.filter((p) => Math.abs(p.diff) > DIVERGE).length,
+    coupled: pairs.filter((p) => p.coupled).length,
+  };
 }

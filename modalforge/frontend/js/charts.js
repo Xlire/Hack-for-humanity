@@ -48,6 +48,44 @@ export function drawSpectrum(canvas, contrib) {
   contrib.slice(0, 2).forEach((c, i) => ctx.fillText(`${c.f.toFixed(0)} Hz`, Math.min(X(c.f) + 5 * d, W - 50 * d), 12 * d + i * 12 * d));
 }
 
+/** Allsolve vs. textbook, mode by mode (crossCheck pairs): x = mode number, y = frequency (log).
+ *  Hollow dots are the rigid-joist / clamped-plate formula, filled dots the 3D solve. A pair whose
+ *  frequencies differ by more than `diverge` gets an amber connector; deck + joist modes a teal ring. */
+export function drawCompare(canvas, pairs, diverge = 0.15) {
+  const { ctx, W, H, d } = fit(canvas);
+  ctx.clearRect(0, 0, W, H);
+  if (!pairs || !pairs.length) return;
+  const all = pairs.flatMap((p) => [p.fem, p.analytic]);
+  const fmin = Math.min(...all) / 1.15, fmax = Math.max(...all) * 1.15;
+  const L = 34 * d, R = 8 * d, T = 8 * d, B = 18 * d;
+  const X = (k) => L + ((k - 0.5) / pairs.length) * (W - L - R);
+  const Y = (f) => H - B - (Math.log(f / fmin) / Math.log(fmax / fmin)) * (H - T - B);
+  ctx.strokeStyle = cssVar("--line"); ctx.fillStyle = cssVar("--muted"); ctx.lineWidth = 1;
+  ctx.font = `${9.5 * d}px "Plex Mono", monospace`; ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  for (const f of [10, 20, 31, 50, 63, 100, 125, 200, 250, 500, 1000, 2000]) {
+    if (f < fmin || f > fmax) continue;
+    const y = Y(f); ctx.beginPath(); ctx.moveTo(L, y); ctx.lineTo(W - R, y); ctx.stroke();
+    ctx.fillText(f >= 1000 ? `${f / 1000}k` : `${f}`, L - 4 * d, y);
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  const every = Math.max(1, Math.ceil(pairs.length / 8));
+  pairs.forEach((p, i) => { if (i % every === 0) ctx.fillText(`#${p.k}`, X(p.k), H - 4 * d); });
+  const r = Math.max(2 * d, Math.min(3.5 * d, (W - L - R) / pairs.length / 3));
+  for (const p of pairs) {
+    const x = X(p.k), off = Math.abs(p.diff) > diverge;
+    ctx.strokeStyle = cssVar(off ? "--amber" : "--line"); ctx.lineWidth = off ? 2 * d : d;
+    ctx.beginPath(); ctx.moveTo(x, Y(p.analytic)); ctx.lineTo(x, Y(p.fem)); ctx.stroke();
+    ctx.strokeStyle = cssVar("--muted"); ctx.lineWidth = d;
+    ctx.beginPath(); ctx.arc(x, Y(p.analytic), r, 0, 2 * Math.PI); ctx.stroke();
+    ctx.fillStyle = cssVar("--copper");
+    ctx.beginPath(); ctx.arc(x, Y(p.fem), r, 0, 2 * Math.PI); ctx.fill();
+    if (p.coupled) {
+      ctx.strokeStyle = cssVar("--teal"); ctx.lineWidth = 1.5 * d;
+      ctx.beginPath(); ctx.arc(x, Y(p.fem), r + 2.5 * d, 0, 2 * Math.PI); ctx.stroke();
+    }
+  }
+}
+
 export function drawModeThumb(canvas, model, mode) {
   const { ctx, W, H } = fit(canvas);
   const nx = 32, ny = Math.max(8, Math.round(32 * model.spec.Ly / model.spec.Lx));

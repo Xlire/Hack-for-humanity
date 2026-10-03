@@ -7,6 +7,7 @@
 //               the highest computed mode. Output is in pascals at the listener.
 
 import { RHO_AIR } from "./physics.js";
+import { renderDebris } from "./debris.js";
 
 export const FS = 48000;
 export const EAR_HEIGHT = 1.5;      // listener ear height above the floor [m]
@@ -34,7 +35,7 @@ export function footForce(shoe, pace, massKg, rng, run = false, force = 1) {
   const jitter = (s) => 1 + (rng() * 2 - 1) * s;
   const Th = (shoe.heelMs / 1000) * jitter(0.12);
   const paceScale = pace.impact / 0.75;
-  const impulse = shoe.impulse * paceScale * Math.sqrt(massKg / 75) * force * jitter(0.15); // N·s
+  const impulse = shoe.impulse * paceScale * (pace.click ?? 1) * Math.sqrt(massKg / 75) * force * jitter(0.15); // N·s
   const Fh = (impulse * Math.PI) / (2 * Th);       // peak of the click half-sine
   const toeDelay = (run ? 0.03 : 0.085) * jitter(0.15);
   const n = Math.ceil((toeDelay + 0.2) * FS);
@@ -48,25 +49,66 @@ export function footForce(shoe, pace, massKg, rng, run = false, force = 1) {
     const i0 = Math.round(t0 * FS), len = Math.max(2, Math.round(T * FS));
     for (let i = 0; i < len && i0 + i < n; i++) F[i0 + i] += A * 0.5 * (1 - Math.cos(2 * Math.PI * i / len));
   };
-  halfSine(0, Th, Fh);                                                   // heel click
-  halfSine(toeDelay, Th * 1.6, Fh * shoe.toeRatio * jitter(0.15));       // forefoot click
-  hann(0, run ? 0.05 : 0.06, pace.impact * BW * jitter(0.08));           // heel loading
-  hann(toeDelay, 0.09, 0.3 * BW * jitter(0.1));                          // forefoot loading
+  const toeClick = Fh * shoe.toeRatio * jitter(0.15);
+  const heelLoadT = run ? 0.05 : 0.06, heelLoad = pace.impact * BW * jitter(0.08);
+  const toeLoad = 0.3 * BW * jitter(0.1);
+  halfSine(0, Th, Fh);                       // heel click
+  halfSine(toeDelay, Th * 1.6, toeClick);    // forefoot click
+  hann(0, heelLoadT, heelLoad);              // heel loading
+  hann(toeDelay, 0.09, toeLoad);             // forefoot loading
+  // parts: the drawn values of this step (the Math & provenance report shows them)
+  return { F, Th, Fh, parts: { BW, impulse, toeDelay, toeClick, heelLoadT, heelLoad, toeLoad } };
+}
+
+/** A foot dragged across the floor [N]: body weight shifting over the slide, plus the roughness of
+ *  sole against surface as a stream of small band-limited impacts (a fraction of a heel click). */
+export function scuffForce(shoe, massKg, rng, slideMs) {
+  const T = (slideMs / 1000) * (1 + (rng() * 2 - 1) * 0.2);
+  const Th = shoe.heelMs / 1000;
+  const Fh = (0.03 * shoe.impulse * Math.PI) / (2 * Th) * Math.sqrt(massKg / 75); // sole roughness: far below a heel click
+  const len = Math.round(T * FS), F = new Float32Array(len + Math.round(0.02 * FS));
+  const alpha = 1 - Math.exp(-2 * Math.PI * Math.min(8000, 0.9 / Th) / FS);
+  const norm = 1 / Math.sqrt(alpha / (2 - alpha)); // unit-RMS one-pole lowpassed noise
+  let lp = 0;
+  for (let i = 0; i < len; i++) {
+    const env = Math.sin(Math.PI * i / len);
+    lp += alpha * ((rng() * 2 - 1) - lp);
+    F[i] = env * env * 0.2 * massKg * G + env * Fh * lp * norm;
+  }
   return { F, Th, Fh };
 }
 
-/** One step at floor position (x, y). Returns mono pressure signal [Pa] and diagnostics. */
-export function renderStep(model, { x, y, listener, shoe, pace, massKg, seed = 1, run = false, maxModes = 1500, force = 1 }) {
+/** One step at floor position (x, y). Returns mono pressure signal [Pa] and diagnostics.
+ *  scuffMs > 0 renders a scuff (sliding foot) of about that length instead of a step.
+ *  debris (a catalogue debris entry) adds loose material on the floor, debrisAmount 0..1 of it. */
+export function renderStep(model, { x, y, listener, shoe, pace, massKg, seed = 1, run = false, maxModes = 1500, force = 1, scuffMs = 0, debris = null, debrisAmount = 0.6 }) {
   const rng = mulberry32(seed);
-  const { F, Th, Fh } = footForce(shoe, pace, massKg, rng, run, force);
+  const foot = scuffMs ? scuffForce(shoe, massKg, rng, scuffMs) : footForce(shoe, pace, massKg, rng, run, force);
+  const { Th, Fh } = foot;
+  let F = foot.F;
+  const nF = F.length;
   const r = Math.hypot(x - listener.x, y - listener.y, EAR_HEIGHT);
   const radiation = RHO_AIR / (2 * Math.PI * r);
+
+  // Loose material on the floor: its own sound, plus the grains' pushes added to the force on the deck.
+  // Own RNG stream, so a floor without debris sounds exactly as before.
+  let deb = null, dampClick = 1, dampHf = 1;
+  if (debris && debrisAmount > 0) {
+    deb = renderDebris(debris, debrisAmount, { F, Th, massKg, impact: force * (pace?.impact ?? 0.75), scuff: !!scuffMs,
+      hardness: shoe.hardness, r, rng: mulberry32((seed ^ 0x9e3779b9) >>> 0) });
+    const F2 = new Float32Array(Math.max(nF, deb.force.length));
+    F2.set(F);
+    for (let i = 0; i < deb.force.length; i++) F2[i] += deb.force[i];
+    F = F2;
+    dampClick = 1 - debrisAmount * (1 - (debris.damp?.click ?? 1));
+    dampHf = 1 - debrisAmount * (1 - (debris.damp?.hf ?? 1));
+  }
 
   // Duration: until the slowest relevant mode has decayed 60 dB (capped).
   const modes = model.modes.slice(0, maxModes);
   let T60max = 0.25;
   for (const m of modes) T60max = Math.max(T60max, Math.min(3.2, 6.91 * m.Q / (Math.PI * m.f)));
-  const N = Math.ceil((T60max + 0.08) * FS);
+  const N = Math.max(Math.ceil((T60max + 0.08) * FS) + (scuffMs ? nF : 0), deb ? deb.air.length : 0);
   const out = new Float32Array(N);
   const contrib = [];
   const dt = 1 / FS;
@@ -97,14 +139,14 @@ export function renderStep(model, { x, y, listener, shoe, pace, massKg, seed = 1
   }
 
   // Contact click: local shoe/surface contact noise, bandwidth set by heel duration.
-  const clickLen = Math.max(Math.round(Th * 2.2 * FS), 48);
+  const clickLen = scuffMs ? nF : Math.max(Math.round(Th * 2.2 * FS), 48);
   const cutoff = Math.min(14000, 0.9 / Th);
   const alpha = 1 - Math.exp(-2 * Math.PI * cutoff / FS);
-  const clickAmp = 2.2e-4 * Fh * shoe.hardness * model.contact / r;
+  const clickAmp = 2.2e-4 * Fh * shoe.hardness * model.contact / r * dampClick;
   let lp = 0;
   for (let i = 0; i < clickLen; i++) {
     lp += alpha * ((rng() * 2 - 1) - lp);
-    out[i] += clickAmp * lp * Math.sin(Math.PI * i / clickLen) * 1.8;
+    out[i] += clickAmp * lp * Math.sin(Math.PI * i / clickLen) * (scuffMs ? 0.35 : 1.8);
   }
 
   // High-frequency fill above the last computed mode (modal density there is high).
@@ -116,7 +158,7 @@ export function renderStep(model, { x, y, listener, shoe, pace, massKg, seed = 1
   const Qavg = modes.length ? modes.reduce((s, m) => s + m.Q, 0) / modes.length : 60;
   const tau = Math.min(0.6, Math.max(0.015, Qavg / (Math.PI * fTop)));
   const bright = 1 / (1 + (fTop * Th * 1.5) ** 2);
-  const hfAmp = 0.35 * rmsEarly * bright;
+  const hfAmp = 0.35 * rmsEarly * bright * dampHf;
   const hpA = Math.exp(-2 * Math.PI * fTop / FS);
   let hpPrevIn = 0, hpOut = 0;
   const nH = Math.min(N, Math.round(tau * 7 * FS));
@@ -125,6 +167,8 @@ export function renderStep(model, { x, y, listener, shoe, pace, massKg, seed = 1
     hpOut = hpA * (hpOut + nIn - hpPrevIn); hpPrevIn = nIn;
     out[i] += hfAmp * hpOut * Math.exp(-i / (tau * FS));
   }
+
+  if (deb) for (let i = 0; i < deb.air.length; i++) out[i] += deb.air[i];
 
   let peakPa = 0;
   for (let i = 0; i < N; i++) peakPa = Math.max(peakPa, Math.abs(out[i]));
