@@ -24,6 +24,7 @@
       <button class="status-pill" id="statusPill" type="button" aria-haspopup="dialog">
         <span class="dot" aria-hidden="true"></span><span id="statusText">Checking Allsolve…</span>
       </button>
+      <button class="btn ghost" id="mathBtn" type="button" aria-haspopup="dialog" title="Every number from floor to sound, tagged Allsolve / local / assumed">Math</button>
       <button class="btn ghost" id="tourBtn" type="button">How it works</button>
       <button class="btn ghost icon" id="themeBtn" type="button" aria-label="Switch light or dark theme" title="Light / dark">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
@@ -79,6 +80,11 @@
       <section class="step" id="stepSim">
         <header class="step-head"><span class="step-no">3</span><h2>Run the physics</h2></header>
         <p class="step-copy" id="simCopy">The preview uses a textbook estimate. Run Allsolve to solve the real 3D floor: boards, joists and supports together.</p>
+        <div class="field">
+          <span class="label">Detail</span>
+          <div class="seg" id="qualitySeg" role="radiogroup" aria-label="Solve detail"></div>
+          <span class="hint" id="qualityHint"></span>
+        </div>
         <button class="btn primary wide" id="simBtn" type="button">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14c2-6 4-6 6 0s4 6 6 0 3-5 4-2"/></svg>
           <span id="simBtnText">Simulate with Allsolve</span>
@@ -94,6 +100,7 @@
           </ol>
           <div class="job-bar"><span id="jobBar"></span></div>
           <div class="job-meta"><span id="jobStage">Queued</span><span id="jobTime" class="mono">0:00</span></div>
+          <dl class="job-timings" id="jobTimings" hidden></dl>
           <pre class="job-log" id="jobLog" aria-live="polite"></pre>
         </div>
       </section>
@@ -159,6 +166,15 @@
           <input type="range" id="mass" min="20" max="140" step="1" value="75">
         </label>
         <div class="field">
+          <span class="label">Ground debris</span>
+          <div class="chips" id="debrisChips" role="radiogroup" aria-label="Ground debris"></div>
+          <span class="hint" id="debrisHint"></span>
+        </div>
+        <label class="field" id="debrisAmountField">
+          <span class="label">Debris amount <output id="debrisAmountOut" class="val"></output></span>
+          <input type="range" id="debrisAmount" min="5" max="100" step="5" value="60">
+        </label>
+        <div class="field">
           <span class="label">Room echo</span>
           <div class="chips" id="roomChips" role="radiogroup" aria-label="Room echo"></div>
         </div>
@@ -186,13 +202,33 @@
         </dl>
       </section>
 
+      <section class="panel" id="comparePanel">
+        <h2 class="panel-title">Allsolve vs preview</h2>
+        <p class="hint" id="compareEmpty">Run Allsolve (or pick a floor with a saved result) to hear and see what the 3D solve changes compared with the textbook preview.</p>
+        <div id="compareBody" hidden>
+          <div class="field">
+            <span class="label">Listen with</span>
+            <div class="seg" id="abSeg" role="radiogroup" aria-label="Mode set used for sound">
+              <button type="button" role="radio" data-v="preview" aria-checked="false">Preview</button>
+              <button type="button" role="radio" data-v="allsolve" aria-checked="true">Allsolve</button>
+            </div>
+            <span class="hint">Replays the last step with the same seed, position and shoe. Only the modes change.</span>
+          </div>
+          <canvas id="compareChart" class="compare-chart" aria-label="Mode frequencies: Allsolve against the textbook estimate"></canvas>
+          <p class="compare-key"><span class="k-fem">● Allsolve</span><span class="k-ana">○ textbook</span><span class="k-off">│ &gt; 15 % apart</span><span class="k-cpl">◯ deck + joists</span></p>
+          <p class="compare-summary" id="compareSummary"></p>
+          <dl class="check-list solve-card" id="solveCard"></dl>
+        </div>
+      </section>
+
       <section class="panel" id="exportPanel">
         <h2 class="panel-title">Export</h2>
         <div class="export-list">
           <button class="btn export" id="dlWalk" type="button"><b>Walk</b><span id="dlWalkSub">WAV in the current output format</span></button>
           <button class="btn export" id="dlStep" type="button"><b>Single step</b><span>WAV at the last step position</span></button>
           <button class="btn export" id="dlSteps" type="button"><b>Walk, step by step</b><span>Every step as its own WAV · ZIP</span></button>
-          <button class="btn export" id="dlPack" type="button"><b>Game engine pack</b><span>Unity / Unreal: 4 paces × 10 mono one-shots, loop, manifest · ZIP</span></button>
+          <button class="btn export" id="dlUnreal" type="button"><b>Unreal Engine pack</b><span>Walk, run, land, jump, scuff × 10 · import script + DataTable · ZIP</span></button>
+          <button class="btn export" id="dlPack" type="button"><b>Game engine pack</b><span>Unity / FMOD / Wwise: 7 actions × 10 mono one-shots, loop, manifest · ZIP</span></button>
           <button class="btn export" id="dlModes" type="button"><b>Mode data</b><span>JSON for game engines</span></button>
         </div>
         <label class="check"><input type="checkbox" id="normalize"> Normalize exports to −1 dBFS</label>
@@ -228,6 +264,29 @@ ALLSOLVE_HOST=https://allsolve.quanscient.com/</pre>
       <footer class="dialog-foot">
         <button class="btn ghost" type="button" id="reloadKeysBtn">Reload keys</button>
         <button class="btn primary" type="button" id="testKeysBtn">Test connection</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <!-- ============ math & provenance ============ -->
+  <dialog class="dialog math-dialog" id="mathDialog" aria-labelledby="mathTitle">
+    <form method="dialog" class="dialog-inner">
+      <header class="dialog-head">
+        <h2 id="mathTitle">Math &amp; provenance</h2>
+        <button class="btn ghost icon" value="close" aria-label="Close">✕</button>
+      </header>
+      <p class="hint">How the inputs become this sound, step by step, for the active floor and the last step you played. Every number is tagged with where it comes from.</p>
+      <div class="math-body" id="mathBody"></div>
+      <div class="help-pop" id="helpPop" role="dialog" aria-live="polite" hidden>
+        <b id="helpWhat"></b>
+        <p id="helpText"></p>
+      </div>
+      <footer class="dialog-foot math-foot">
+        <span class="math-job mono" id="mathJob" role="status"></span>
+        <button class="btn ghost math-run" type="button" id="mathSS" title="Allsolve: bare deck, simply supported edges. Compared with the f_mn formula.">Run SS-plate check</button>
+        <button class="btn ghost math-run" type="button" id="mathSens" title="Allsolve: SS plate at half thickness and with another material">Run sensitivity</button>
+        <button class="btn ghost math-run" type="button" id="mathRefine" title="Allsolve: the same floor with a 0.7× smaller mesh">Refine mesh ×0.7</button>
+        <button class="btn primary" type="button" id="mathExport">Export report (.md + .json)</button>
       </footer>
     </form>
   </dialog>

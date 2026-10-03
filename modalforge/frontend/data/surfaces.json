@@ -51,6 +51,41 @@
       "joists": null
     }
   ],
+  "_debris": "Loose material on top of the floor, synthesised by js/debris.js (the backend ignores it). grains: expected count per step at full amount, frequency band [fLo, fHi] of each grain's little modal bank, its Q and number of modes, level (loudest grain, relative), tick (contact noise), snap (chance of a brittle crack), release (activity when the load falls). settle: late tumbling grains. hiss: band-passed friction noise riding the load. force: how hard grains push the deck (makes the floor ring). damp: how much the layer softens the shoe click and the high-frequency fill at full amount.",
+  "debris": [
+    {
+      "id": "glass", "name": "Broken glass", "blurb": "Shards crunch, snap and tinkle under the sole.", "sprite": "shards",
+      "grains": { "count": 28, "fLo": 2200, "fHi": 9500, "q": 90, "modes": 4, "level": 1.3, "tick": 0.4, "snap": 0.55, "release": 0.25 },
+      "settle": { "count": 4, "ms": 180, "level": 0.25 },
+      "hiss": { "level": 0.12, "fLo": 3000, "fHi": 11000 },
+      "force": 0.4, "damp": { "click": 1.0, "hf": 1.0 }
+    },
+    {
+      "id": "gravel", "name": "Gravel", "blurb": "Loose stones clack and shift as the weight rolls over them.", "sprite": "stones",
+      "grains": { "count": 40, "fLo": 500, "fHi": 3800, "q": 14, "modes": 3, "level": 1.1, "tick": 0.7, "snap": 0.05, "release": 0.6 },
+      "settle": { "count": 6, "ms": 320, "level": 0.35 },
+      "hiss": { "level": 0.35, "fLo": 800, "fHi": 5000 },
+      "force": 1.0, "damp": { "click": 0.7, "hf": 0.85 }
+    },
+    {
+      "id": "sand", "name": "Sand", "blurb": "A thin layer of grit that hisses as it slides. Softens the heel.", "sprite": "sand",
+      "grains": { "count": 350, "fLo": 1500, "fHi": 7000, "q": 3, "modes": 1, "level": 0.18, "tick": 1.0, "snap": 0, "release": 0.5 },
+      "hiss": { "level": 1.0, "fLo": 1500, "fHi": 6000 },
+      "force": 0.05, "damp": { "click": 0.3, "hf": 0.4 }
+    },
+    {
+      "id": "leaves", "name": "Dry leaves", "blurb": "Brittle leaves crackle and rustle.", "sprite": "leaves",
+      "grains": { "count": 120, "fLo": 1000, "fHi": 6000, "q": 4, "modes": 2, "level": 0.35, "tick": 1.0, "snap": 0.3, "release": 0.7 },
+      "hiss": { "level": 0.4, "fLo": 2000, "fHi": 8000 },
+      "force": 0.05, "damp": { "click": 0.6, "hf": 0.8 }
+    },
+    {
+      "id": "snow", "name": "Packed snow", "blurb": "Snow compacting with a dull squeaky crunch. Muffles the floor.", "sprite": "snow",
+      "grains": { "count": 90, "fLo": 400, "fHi": 2500, "q": 5, "modes": 2, "level": 0.4, "tick": 0.8, "snap": 0.1, "release": 0.1 },
+      "hiss": { "level": 0.6, "fLo": 500, "fHi": 3000 },
+      "force": 0.1, "damp": { "click": 0.35, "hf": 0.3 }
+    }
+  ],
   "shoes": {
     "heels":    { "name": "High heels",   "heelMs": 1.6,  "toeRatio": 0.25, "hardness": 1.00, "impulse": 0.3 },
     "leather":  { "name": "Leather shoes","heelMs": 3.0,  "toeRatio": 0.35, "hardness": 0.80, "impulse": 0.22 },
@@ -63,6 +98,12 @@
     "walk":   { "name": "Walk",   "cadence": 110, "impact": 0.75 },
     "brisk":  { "name": "Brisk",  "cadence": 125, "impact": 0.95 },
     "run":    { "name": "Run",    "cadence": 165, "impact": 1.60 }
+  },
+  "_actions": "One-shots beyond walking, for game engine packs. Land: both feet, ~2.5 body weights, the second foot 8-30 ms late. Jump: the take-off push, mostly forefoot (click scales the heel/toe click impulse). Scuff: a foot dragged for slideMs.",
+  "actions": {
+    "land":  { "name": "Land",  "impact": 2.4, "feet": 2 },
+    "jump":  { "name": "Jump",  "impact": 1.3, "click": 0.35, "run": true },
+    "scuff": { "name": "Scuff", "slideMs": 220 }
   },
   "_rooms": "Room echo presets. rt60 [s], wet send, pre-delay [ms], early reflections and discrete echoes as [ms, gain], hfDamp 0..1 (how fast highs die in the tail), flutter = repeating echo between parallel walls.",
   "rooms": {

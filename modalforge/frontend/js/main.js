@@ -1,9 +1,11 @@
-import { analyticModes, buildModel, crossCheck, joistPositions } from "./physics.js";
+import { analyticModes, buildModel, crossCheck, joistPositions, COUPLED_SHARE, DIVERGE } from "./physics.js";
 import { FS, mulberry32, renderStep, renderWalk, finishMix, planSteps, renderModeTone, dbSPL, EAR_HEIGHT, PA_TO_DIGITAL } from "./synth.js";
 import { OUTPUTS, spatialize, downmixStereo, LFE_INDEX } from "./spatial.js";
 import { FloorView, drawTexture, heat } from "./floor.js";
-import { drawWave, drawSpectrum, drawModeThumb } from "./charts.js";
-import { encodeWav, makeZip, download, trimTail, wrapLoop, peakOf, rmsDb } from "./export.js";
+import { drawWave, drawSpectrum, drawModeThumb, drawCompare } from "./charts.js";
+import { encodeWav, makeZip, download, trimTail, wrapLoop, peakOf } from "./export.js";
+import { buildReport, renderHtml, renderMarkdown } from "./report.js";
+import { VARIATIONS, pascal, packGroups, renderShots, genericPackFiles, unrealPackFiles } from "./pack.js";
 
 const $ = (s) => document.querySelector(s);
 const store = {
@@ -13,10 +15,25 @@ const store = {
 
 const S = {
   cat: null, surface: null, floorSize: "landing", Lx: 2.4, Ly: 1.8, deckMaterial: null, thickness: 0.022, spacing: 0.6,
-  shoe: "leather", pace: "walk", mass: 75, room: "normal", output: "binaural", loop: false, vary: true,
+  shoe: "leather", pace: "walk", mass: 75, debris: "none", debrisAmount: 0.6, room: "normal", output: "binaural", loop: false, vary: true,
   result: null, model: null, view: null, audio: null, oneShot: null, sources: new Set(), outCh: 0,
   lastStep: null, lastWalk: null, walking: false, walkRun: 0, walkTimers: [], job: null, lookupSeq: 0, packBusy: false,
+  hit: null, mathBusy: false, report: null,
+  quality: "draft", previewModel: null, femModel: null, ab: "allsolve",
 };
+
+// Allsolve detail presets (mirrors QUALITY in backend/model.py)
+const QUALITY = {
+  draft: { name: "Draft", hint: "Mesh for 1 kHz, 30 modes, 12 × 8 shape grid. The quick one." },
+  standard: { name: "Standard", hint: "Mesh for 1.8 kHz, 60 modes, 24 × 16 shape grid." },
+  fine: { name: "Fine", hint: "Mesh for 2.5 kHz, 100 modes, 24 × 16 shape grid. The slowest." },
+};
+const TIMING_LABELS = {
+  wait_local: "Waiting", connect: "Connect", reset: "Clear project", geometry: "Geometry", setup: "Model setup",
+  mesh_queue: "Mesh queue", mesh_run: "Meshing", mesh_output: "Mesh output", solve_setup: "Solve setup",
+  solve_queue: "Solve queue", solve_run: "Eigensolve", solve_output: "Output proc.", extract: "Read results", total: "Total",
+};
+const fmtS = (s) => (s >= 60 ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}` : `${s.toFixed(0)} s`);
 
 // ------------------------------------------------------------------------------- boot
 init().catch((e) => { console.error(e); toast(`Could not start: ${e.message}`); });
@@ -24,6 +41,8 @@ init().catch((e) => { console.error(e); toast(`Could not start: ${e.message}`); 
 async function init() {
   document.documentElement.dataset.theme = store.get("mf-theme", "dark");
   S.room = store.get("mf-room", "normal"); S.output = store.get("mf-output", "binaural"); S.loop = store.get("mf-loop", false); S.vary = store.get("mf-vary", true);
+  S.debris = store.get("mf-debris", "none"); S.debrisAmount = store.get("mf-debris-amount", 0.6);
+  S.quality = store.get("mf-quality", "draft"); if (!QUALITY[S.quality]) S.quality = "draft";
   S.cat = await (await fetch("data/surfaces.json")).json();
   S.view = new FloorView($("#floor"), {
     onStep: (x, y) => stepAt(x, y),
@@ -32,6 +51,7 @@ async function init() {
   });
   buildControls();
   selectSurface(S.cat.surfaces[0].id);
+  syncDebris();
   refreshStatus();
   wire();
   // Automated checks. #selftest renders a walk, reverb, WAV and ZIP and reports into the DOM.
@@ -55,11 +75,25 @@ async function init() {
         const wav = encodeWav(mixed, FS, true, { bits: 24 });
         const hv = new DataView(wav.buffer);
         const pack = await buildPack();
+        const debris = {};
+        for (const d of S.cat.debris || []) {
+          const r = renderStep(S.model, { ...walker(), debris: d, debrisAmount: 0.6, x: 1, y: 0.9, seed: 7 });
+          S.view.setDebris(d.sprite, 0.6);
+          debris[d.id] = { peakDb: +dbSPL(r.peakPa).toFixed(1), seconds: +(r.signal.length / FS).toFixed(2), finite: r.signal.every(Number.isFinite), sprites: S.view.debris.bits.length };
+        }
+        S.view.setDebris(null);
         Object.assign(out, { ok: true, source: S.model.source, modes: S.model.modes.length, steps: steps.length,
           seconds: +(mixed[0].length / FS).toFixed(2), peak: +peakOf(mixed).toFixed(3), outputs, rooms,
           wav51: { format: hv.getUint16(20, true).toString(16), channels: hv.getUint16(22, true), bits: hv.getUint16(34, true), mask: hv.getUint32(40, true).toString(16), bytes: wav.length },
           pack: { files: pack.files.length, names: pack.files.map((f) => f.name).filter((n) => !n.includes("/Mono_Dry/")), zipBytes: pack.zip.size },
-          check: crossCheck(S.cat, S.model) });
+          debris, check: crossCheck(S.cat, S.model) });
+        if (S.femModel) {
+          const c = crossCheck(S.cat, S.femModel, S.previewModel.raw);
+          out.compare = { quality: S.femModel.meta.quality ?? null, grid: `${S.femModel.grid.nx}x${S.femModel.grid.ny}`, pairs: c.pairs.length,
+            lowest: c.pairs.slice(0, 3).map((p) => +(p.diff * 100).toFixed(1)), diverging: c.diverging, coupled: c.coupled,
+            panelShown: !$("#compareBody").hidden, cards: $("#solveCard").children.length,
+            badges: document.querySelectorAll("#modeStrip .badge").length };
+        }
       } catch (e) { Object.assign(out, { ok: false, error: String(e && e.stack || e) }); }
       document.body.setAttribute("data-selftest", JSON.stringify(out));
     }, 1500);
@@ -103,6 +137,9 @@ function buildControls() {
   dm.addEventListener("change", () => { S.deckMaterial = dm.value; onFloorChange(); });
   $("#thickness").addEventListener("input", (e) => { S.thickness = +e.target.value / 1000; syncOutputs(); onFloorChange(); });
   $("#spacing").addEventListener("input", (e) => { S.spacing = +e.target.value / 100; syncOutputs(); onFloorChange(); });
+  seg($("#qualitySeg"), Object.entries(QUALITY).map(([id, q]) => [id, q.name]), () => S.quality,
+    (v) => { S.quality = v; store.set("mf-quality", v); $("#qualityHint").textContent = QUALITY[v].hint; onFloorChange(); });
+  $("#qualityHint").textContent = QUALITY[S.quality].hint;
 
   const chips = $("#shoeChips");
   for (const [id, s] of Object.entries(S.cat.shoes)) {
@@ -112,6 +149,12 @@ function buildControls() {
   }
   seg($("#paceSeg"), Object.entries(S.cat.paces).map(([id, p]) => [id, p.name]), () => S.pace, (v) => { S.pace = v; onWalkerChange(); });
   $("#mass").addEventListener("input", (e) => { S.mass = +e.target.value; syncOutputs(); onWalkerChange(); });
+  if (S.debris !== "none" && !debrisOf(S.debris)) S.debris = "none";
+  seg($("#debrisChips"), [["none", "None"], ...(S.cat.debris || []).map((d) => [d.id, d.name])], () => S.debris,
+    (v) => { S.debris = v; store.set("mf-debris", v); syncDebris(); replayLastStep(); });
+  $("#debrisAmount").value = Math.round(S.debrisAmount * 100);
+  $("#debrisAmount").addEventListener("input", (e) => { S.debrisAmount = +e.target.value / 100; store.set("mf-debris-amount", S.debrisAmount); syncDebris(); });
+  $("#debrisAmount").addEventListener("change", replayLastStep);
   if (!S.cat.rooms[S.room]) S.room = "normal";
   if (!OUTPUTS[S.output]) S.output = "binaural";
   seg($("#roomChips"), Object.entries(S.cat.rooms).map(([id, r]) => [id, r.name]), () => S.room,
@@ -152,6 +195,17 @@ function syncSize() {
   $("#sizeSeg").querySelectorAll("button").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.v === S.floorSize)));
 }
 
+const debrisOf = (id) => (S.cat.debris || []).find((d) => d.id === id) || null;
+
+/** Debris readouts, and the loose material drawn on the floor. */
+function syncDebris() {
+  const d = debrisOf(S.debris);
+  $("#debrisHint").textContent = d ? d.blurb : "Bare floor. Scatter glass, gravel or sand on it to hear them under the feet.";
+  $("#debrisAmountField").hidden = !d;
+  $("#debrisAmountOut").textContent = `${Math.round(S.debrisAmount * 100)} %`;
+  S.view.setDebris(d?.sprite, S.debrisAmount);
+}
+
 function syncOutputs() {
   $("#thicknessOut").textContent = `${Math.round(S.thickness * 1000)} mm`;
   $("#spacingOut").textContent = `${Math.round(S.spacing * 100)} cm`;
@@ -186,7 +240,7 @@ function currentSpec() {
 
 function requestBody(fresh = false) {
   return { surfaceId: S.surface.id, floorSize: S.floorSize, Lx: S.Lx, Ly: S.Ly, deckMaterial: S.deckMaterial,
-    thickness: S.thickness, joistSpacing: S.surface.joists ? S.spacing : null, fresh };
+    thickness: S.thickness, joistSpacing: S.surface.joists ? S.spacing : null, quality: S.quality, fresh };
 }
 
 let floorTimer = 0;
@@ -195,10 +249,10 @@ function onFloorChange(delay = 90) {
   clearTimeout(floorTimer);
   floorTimer = setTimeout(async () => {
     applyResult(analyticModes(S.cat, currentSpec()));
-    // Is there a saved Allsolve result for exactly this floor? Use it.
+    // Is there a saved Allsolve result for exactly this floor? Use it (the chosen detail first, else the most detailed saved).
     const seq = ++S.lookupSeq;
     try {
-      const r = await fetch("api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(requestBody()) });
+      const r = await fetch("api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...requestBody(), anyQuality: true }) });
       if (r.ok && seq === S.lookupSeq) applyResult(fromBackend((await r.json()).result));
     } catch { /* backend offline: preview only */ }
   }, delay);
@@ -217,30 +271,107 @@ function fromBackend(r) {
   return r;
 }
 
+const specKey = (s) => JSON.stringify([s.surfaceId, s.Lx, s.Ly, s.deckMaterial, s.thickness, s.joists?.spacing ?? null]);
+
+/** A new mode set arrived. Both models stay in memory (S.previewModel, S.femModel), so the
+ *  Preview / Allsolve switch is instant and compares the same floor. */
 function applyResult(result) {
   S.result = result;
-  S.model = buildModel(S.cat, result);
+  if (result.source === "allsolve") {
+    S.femModel = buildModel(S.cat, result);
+    if (!S.previewModel || specKey(S.previewModel.spec) !== specKey(S.femModel.spec)) {
+      S.previewModel = buildModel(S.cat, analyticModes(S.cat, S.femModel.spec));
+    }
+  } else {
+    S.femModel = null;
+    S.previewModel = buildModel(S.cat, result);
+  }
+  showModel();
+  const fem = S.femModel;
+  $("#simBtnText").textContent = fem ? "Solve again with Allsolve" : "Simulate with Allsolve";
+  $("#freshRun").parentElement.hidden = !fem;
+  renderCompare();
+}
+
+/** Puts the preview or the Allsolve model on the floor, the mode strip and the synthesiser. */
+function showModel() {
+  const useFem = S.femModel && S.ab === "allsolve";
+  S.model = useFem ? S.femModel : S.previewModel;
   S.view.setModel(S.model, S.surface.texture);
   S.view.selectedMode = null;
   renderModeStrip();
   renderCheck();
-  const badge = $("#sourceBadge");
-  badge.dataset.source = result.source;
-  $("#sourceText").textContent = result.source === "allsolve"
-    ? `Allsolve FEM · ${result.modes.length} modes${result.meta?.fromCache ? " · saved result" : ""}`
-    : "Analytical preview · run Allsolve for the full 3D solve";
-  $("#simBtnText").textContent = result.source === "allsolve" ? "Solve again with Allsolve" : "Simulate with Allsolve";
-  $("#freshRun").parentElement.hidden = result.source !== "allsolve";
+  const badge = $("#sourceBadge"), meta = S.model.meta || {};
+  badge.dataset.source = S.model.source;
+  const q = meta.quality ? ` · ${QUALITY[meta.quality]?.name || meta.quality}` : "";
+  $("#sourceText").textContent = useFem
+    ? `Allsolve FEM${q} · ${S.model.modes.filter((m) => m.tag !== "analytic-ext").length} modes${meta.fromCache ? " · saved result" : ""}`
+    : S.femModel ? "Analytical preview · Allsolve result loaded, switch under Allsolve vs preview"
+      : "Analytical preview · run Allsolve for the full 3D solve";
+  document.querySelectorAll("#abSeg button").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.v === (useFem ? "allsolve" : "preview"))));
   if (S.view.overlay === "loudness") updateLoudness();
+}
+
+/** A/B listening: same step (seed, position, shoe), other mode set. */
+function switchAB(which) {
+  if (!S.femModel || S.ab === which) return;
+  S.ab = which;
+  showModel();
+  if (S.walking) return;
+  const st = S.lastStep;
+  if (st) stepAt(st.x, st.y, st.seed);
+  else { const { Lx, Ly } = S.model.spec; stepAt(Lx * 0.42, Ly * 0.55, 1234); }
+}
+
+/** What the 3D solve changed: mode-by-mode comparison with the textbook estimate, and the solve card. */
+function renderCompare() {
+  const fem = S.femModel;
+  $("#compareEmpty").hidden = !!fem;
+  $("#compareBody").hidden = !fem;
+  if (!fem) return;
+  const c = crossCheck(S.cat, fem, S.previewModel.raw);
+  requestAnimationFrame(() => drawCompare($("#compareChart"), c.pairs, DIVERGE));
+  const pct = (d) => `${d >= 0 ? "+" : "−"}${Math.abs(d * 100).toFixed(0)} %`;
+  const low = c.pairs.slice(0, 4).map((p) => `#${p.k} <b>${pct(p.diff)}</b>`).join(", ");
+  let html = `Allsolve vs textbook, lowest modes: ${low}. Median shift ${(c.medianAbsDiff * 100).toFixed(0)} % over ${c.pairs.length} modes; `
+    + `${c.diverging} differ by more than ${(DIVERGE * 100).toFixed(0)} %. `
+    + `Up to ${c.fTop.toFixed(0)} Hz the textbook model has <b>${c.analyticBelowTop}</b> modes, Allsolve <b>${c.femBelowTop}</b>.`;
+  if (fem.spec.joists) {
+    html += c.coupled
+      ? ` <b>${c.coupled}</b> mode${c.coupled > 1 ? "s" : ""} move deck and joists together (joists carry > ${(COUPLED_SHARE * 100).toFixed(0)} % of the energy). The preview holds the joists rigid in its bay modes, so this is what the 3D solve adds.`
+      : " No mode puts more than 20 % of its energy into the joists: on this floor the joists act as near-rigid supports.";
+  }
+  $("#compareSummary").innerHTML = html;
+
+  const m = fem.meta || {}, solved = fem.modes.filter((x) => x.tag !== "analytic-ext");
+  const rows = [["Source", `<span class='good'>Allsolve 3D FEM</span>${m.fromCache ? " · saved" : " · new"}`]];
+  const qname = QUALITY[m.quality]?.name || m.quality || "–";
+  rows.push(["Detail", `${qname}${m.fMaxHz ? ` · mesh for ${(m.fMaxHz / 1000).toFixed(1)} kHz` : ""}${m.numRequested ? ` · ${m.numRequested} requested` : ""}`]);
+  rows.push(["Shape grid", `${fem.grid.nx} × ${fem.grid.ny} probes`]);
+  if (m.mesh?.nodes) rows.push(["Mesh", `${m.mesh.nodes.toLocaleString("en")} nodes${m.mesh.elements ? ` · ${m.mesh.elements.toLocaleString("en")} el.` : ""}`]);
+  else if (m.meshMaxSize) rows.push(["Mesh", `≤ ${(m.meshMaxSize * 1000).toFixed(0)} mm elements`]);
+  rows.push(["Modes solved", `${solved.length} (${solved[0]?.f.toFixed(0)}–${solved[solved.length - 1]?.f.toFixed(0)} Hz)`]);
+  if (m.extendedModes) rows.push(["Added analytically", `+${m.extendedModes} above ${m.extendedFrom.toFixed(0)} Hz`]);
+  if (m.timings) {
+    for (const [k, v] of Object.entries(m.timings)) if (k !== "total" && v >= 0.5) rows.push([TIMING_LABELS[k] || k, fmtS(v)]);
+    if (m.timings.total) rows.push(["Total", `<b>${fmtS(m.timings.total)}</b>`]);
+  } else if (m.elapsedS) rows.push(["Total", fmtS(m.elapsedS)]);
+  if (m.nodeType) rows.push(["Node", m.nodeType.replace(/^CORES_(\d+)_(\d+)GB$/, "$1 cores · $2 GB")]);
+  if (m.projectUrl) rows.push(["Allsolve project", `<a href="${m.projectUrl}" target="_blank" rel="noopener">Open ↗</a>`]);
+  $("#solveCard").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("");
 }
 
 function renderModeStrip() {
   const strip = $("#modeStrip");
   strip.innerHTML = "";
   S.model.modes.slice(0, 14).forEach((m, k) => {
-    const b = el("button", { className: "mode-card", type: "button", role: "listitem", "aria-pressed": "false", title: `Mode ${k + 1}: ${m.f.toFixed(1)} Hz, Q ${m.Q.toFixed(0)}` });
+    // FEM modes where the joists carry a real share of the energy: the preview (rigid joists) has no such mode
+    const coupled = S.model.source === "allsolve" && m.tag !== "analytic-ext" && m.joistShare > COUPLED_SHARE;
+    const b = el("button", { className: "mode-card", type: "button", role: "listitem", "aria-pressed": "false",
+      title: `Mode ${k + 1}: ${m.f.toFixed(1)} Hz, Q ${m.Q.toFixed(0)}${S.model.source === "allsolve" && S.model.spec.joists ? `, joists carry ${(m.joistShare * 100).toFixed(0)} % of the energy` : ""}` });
     const cv = el("canvas");
     b.append(cv, el("span", { innerHTML: `${m.f < 100 ? m.f.toFixed(1) : m.f.toFixed(0)} Hz <i>#${k + 1}</i>` }));
+    if (coupled) b.append(el("span", { className: "badge", textContent: "deck + joists" }));
     b.addEventListener("click", () => {
       const on = S.view.selectedMode !== k;
       S.view.selectedMode = on ? k : null;
@@ -277,7 +408,8 @@ function renderCheck() {
 
 // ------------------------------------------------------------------------------- sound
 function walker() {
-  return { shoe: S.cat.shoes[S.shoe], pace: S.cat.paces[S.pace], massKg: S.mass, listener: S.view.listener, run: S.pace === "run" };
+  return { shoe: S.cat.shoes[S.shoe], pace: S.cat.paces[S.pace], massKg: S.mass, listener: S.view.listener, run: S.pace === "run",
+    debris: debrisOf(S.debris), debrisAmount: S.debrisAmount };
 }
 
 function ensureAudio() {
@@ -366,6 +498,7 @@ async function stepAt(x, y, seed = (Math.random() * 1e9) | 0) {
   play(mixed);
   S.view.excite(x, y, r.contrib, 1, Math.PI / 2);
   S.lastStep = { x, y, seed, mixed, r, output: S.output, room: S.room };
+  S.hit = { x, y, seed, force: 1, origin: "last single step (clicked on the floor)" };
   showSound(mixed, r);
   $("#floorHint").style.opacity = 0;
 }
@@ -425,6 +558,10 @@ async function walk() {
     const lead = (when - S.audio.currentTime) * 1000;
     p.rendered.forEach(({ s, r }) => S.walkTimers.push(setTimeout(() => S.view.excite(s.x, s.y, r.contrib, s.side, s.angle), lead + s.t * 1000)));
     S.lastWalk = p;
+    // Math & provenance follows the loudest step of the walk (same seed as renderWalk gave it).
+    const iLoud = p.rendered.reduce((bi, x, i, a) => (x.r.peakPa > a[bi].r.peakPa ? i : bi), 0);
+    const sL = p.rendered[iLoud].s;
+    S.hit = { x: sL.x, y: sL.y, seed: (p.seed + iLoud * 7919) >>> 0, force: sL.force ?? 1, origin: `walk step #${iLoud + 1} of ${p.rendered.length} (the loudest)` };
     showSound(p.mixed, p.rendered.reduce((a, b) => (b.r.peakPa > a.r.peakPa ? b : a)).r);
     renderStepList();
     when += period;
@@ -521,6 +658,7 @@ async function simulate() {
   const btn = $("#simBtn"); btn.classList.add("running"); btn.disabled = true;
   $("#simBtnText").textContent = "Solving on Allsolve…";
   const panel = $("#jobPanel"); panel.hidden = false; panel.classList.remove("error");
+  renderTimings(null);
   pollJob();
 }
 
@@ -532,6 +670,7 @@ async function pollJob() {
   $("#jobTime").textContent = `${Math.floor(j.elapsedS / 60)}:${String(Math.floor(j.elapsedS % 60)).padStart(2, "0")}`;
   $("#jobLog").textContent = j.logs.join("\n");
   $("#jobLog").scrollTop = 1e9;
+  renderTimings(j.timings || j.result?.meta?.timings);
   const order = ["geometry", "mesh", "solve", "results"];
   const st = /mesh/i.test(j.stage) ? "mesh" : /solv|eigen/i.test(j.stage) ? "solve" : /result|done/i.test(j.stage) ? "results" : "geometry";
   document.querySelectorAll("#jobStages li").forEach((li) => {
@@ -553,13 +692,20 @@ async function pollJob() {
   }
 }
 
+/** Wall time per finished stage of the running (or finished) Allsolve job. */
+function renderTimings(t) {
+  const box = $("#jobTimings");
+  const rows = Object.entries(t || {}).filter(([k, v]) => k !== "total" && v >= 0.5);
+  box.hidden = !rows.length;
+  box.innerHTML = rows.map(([k, v]) => `<div><dt>${TIMING_LABELS[k] || k}</dt><dd>${fmtS(v)}</dd></div>`).join("")
+    + (t?.total ? `<div class="now"><dt>Total</dt><dd>${fmtS(t.total)}</dd></div>` : "");
+}
+
 // ------------------------------------------------------------------------------- export
-function fileBase() { return `modalforge_${S.surface.id}_${S.shoe}${S.model.source === "allsolve" ? "" : "_preview"}`; }
+function fileBase() { return `modalforge_${S.surface.id}${S.debris !== "none" ? `_${S.debris}` : ""}_${S.shoe}${S.model.source === "allsolve" ? "" : "_preview"}`; }
 const norm = () => $("#normalize").checked;
 const outTag = () => (S.output === "binaural" ? "binaural" : S.output === "stereo" ? "stereo" : S.output.replace(".", ""));
-const pascal = (s) => s.replace(/\(.*?\)/g, "").split(/[^A-Za-z0-9]+/).filter(Boolean).map((w) => w[0].toUpperCase() + w.slice(1)).join("");
 const pad2 = (n) => String(n).padStart(2, "0");
-const VARIATIONS = 10;
 
 /** The last walk pass (rendering one silently if there is none), mixed for the current room + output. */
 async function currentWalk() {
@@ -612,33 +758,24 @@ async function renderLoop(n = 8) {
   return wrapLoop(await mixItems(items, listener, "stereo"), Math.round(n * dt * FS));
 }
 
-/** Unity / Unreal footstep pack for the current surface + shoe, all paces. */
-async function buildPack() {
-  const sName = pascal(S.surface.name), shName = pascal(S.cat.shoes[S.shoe].name);
-  const root = `ModalForge_${sName}_${shName}`;
-  const { Lx, Ly } = S.model.spec;
-  const shots = [];
-  const paces = Object.entries(S.cat.paces);
-  for (const [k, [pid, pace]] of paces.entries()) {
-    toast(`Rendering ${pace.name} steps (${k + 1}/${paces.length})…`);
+/** All paces and actions (land, jump, scuff) of the current surface + shoe as dry mono variation sets. */
+async function packShots() {
+  return renderShots(S.model, S.cat, walker(), { seed: (Math.random() * 1e9) >>> 0, onProgress: async (k, n, g) => {
+    toast(`Rendering ${g.pace.name} (${k + 1}/${n})…`);
     await sleep(30); // let the toast paint between renders
-    for (let v = 1; v <= VARIATIONS; v++) {
-      const x = 0.15 + Math.random() * (Lx - 0.3), y = 0.15 + Math.random() * (Ly - 0.3), seed = (Math.random() * 1e9) | 0;
-      const r = renderStep(S.model, { ...walker(), pace, run: pid === "run", x, y, seed });
-      const file = `SFX_Footstep_${sName}_${shName}_${pascal(pace.name)}_${pad2(v)}.wav`;
-      shots.push({ path: `${root}/Mono_Dry/${pascal(pace.name)}/${file}`, file, sig: trimTail(toDigital(r.signal)),
-        pace: pace.name, variation: v, seed, x, y, peakSPL: dbSPL(r.peakPa) });
-    }
-  }
-  // One gain for the whole set: a run stays louder than a stroll, variations keep their natural spread.
-  const gain = 0.891 / peakOf(shots.map((s) => s.sig));
-  const gDb = 20 * Math.log10(gain);
-  const files = shots.map((s) => ({ name: s.path, data: encodeWav([s.sig], FS, false, { bits: 24, gain }) }));
-  const manifest = shots.map((s) => ({
-    file: s.path.slice(root.length + 1), pace: s.pace, variation: s.variation, seed: s.seed, x_m: +s.x.toFixed(3), y_m: +s.y.toFixed(3),
-    duration_s: +(s.sig.length / FS).toFixed(3), peak_dBFS: +(20 * Math.log10(peakOf([s.sig])) + gDb).toFixed(1),
-    rms_dBFS: +(rmsDb([s.sig]) + gDb).toFixed(1), peak_dB_SPL_at_listener: +s.peakSPL.toFixed(1),
-  }));
+  } });
+}
+
+const packInfo = () => {
+  const d = debrisOf(S.debris);
+  return { surface: d ? `${S.surface.name} with ${d.name}` : S.surface.name, shoe: S.cat.shoes[S.shoe].name, massKg: S.mass, source: S.model.source,
+    ...(d ? { debris: d.id, debrisAmount: S.debrisAmount } : {}) };
+};
+
+/** Unity / FMOD / Wwise footstep pack for the current surface + shoe. */
+async function buildPack() {
+  const info = packInfo();
+  const { root, files, rows, csv, sName, shName, volume, volumeDb, levels } = genericPackFiles(await packShots(), info);
 
   toast("Rendering loop and preview…");
   await sleep(30);
@@ -648,17 +785,31 @@ async function buildPack() {
   const previewName = `SFX_Footstep_${sName}_${shName}_Walk_${pascal(S.cat.rooms[S.room].name)}_${outTag()}.wav`;
   if (w) files.push({ name: `${root}/Preview_Wet/${previewName}`, data: encodeWav(w.mixed, FS, true, { bits: 24 }) });
 
-  const info = {
-    generator: "ModalForge", surface: S.surface.name, shoe: S.cat.shoes[S.shoe].name, massKg: S.mass, source: S.model.source,
-    sampleRate: FS, bitDepth: 24, channels: 1, processing: "dry (no room), trimmed to -70 dB, 5 ms fade, one shared gain to -1 dBFS",
-    loop: `Loops/${loopName}`, preview: w ? `Preview_Wet/${previewName}` : null, files: manifest,
-  };
+  const full = { generator: "ModalForge", ...info, sampleRate: FS, bitDepth: 24, channels: 1,
+    processing: "dry (no room), transient at sample 0, trimmed to -70 dB, 5 ms fade", levels, volume, volumeDb,
+    loop: `Loops/${loopName}`, preview: w ? `Preview_Wet/${previewName}` : null, files: rows };
   const enc = new TextEncoder();
-  files.push({ name: `${root}/manifest.json`, data: enc.encode(JSON.stringify(info, null, 2)) });
-  const cols = Object.keys(manifest[0]);
-  files.push({ name: `${root}/manifest.csv`, data: enc.encode([cols.join(",")].concat(manifest.map((m) => cols.map((c) => m[c]).join(","))).join("\n") + "\n") });
-  files.push({ name: `${root}/README.txt`, data: enc.encode(packReadme(info, sName, shName)) });
+  files.push({ name: `${root}/manifest.json`, data: enc.encode(JSON.stringify(full, null, 2)) });
+  files.push({ name: `${root}/manifest.csv`, data: enc.encode(csv) });
+  files.push({ name: `${root}/README.txt`, data: enc.encode(packReadme(full, sName, shName)) });
   return { root, files, zip: makeZip(files) };
+}
+
+/** Unreal Engine pack: waves with Unreal names, DataTable CSV, one-step editor import script. */
+async function buildUnrealPack() {
+  const importScript = await (await fetch("unreal/import_modalforge.py")).text();
+  const { root, files } = unrealPackFiles(await packShots(), packInfo(), { importScript });
+  return { root, files, zip: makeZip(files) };
+}
+
+async function exportUnrealPack() {
+  if (S.packBusy) return;
+  S.packBusy = true;
+  try {
+    const { root, zip } = await buildUnrealPack();
+    download(zip, `${root}.zip`, "application/zip");
+    toast("Unreal pack ready. In Unreal: Tools → Execute Python Script → import_modalforge.py");
+  } finally { S.packBusy = false; }
 }
 
 async function exportPack() {
@@ -672,7 +823,7 @@ async function exportPack() {
 }
 
 function packReadme(info, sName, shName) {
-  const paces = Object.values(S.cat.paces).map((p) => pascal(p.name)).join(", ");
+  const paces = packGroups(S.cat).map((g) => g.name).join(", ");
   return `ModalForge footstep pack
 ========================
 Surface: ${info.surface}    Footwear: ${info.shoe}    Walker: ${info.massKg} kg    Modes: ${info.source === "allsolve" ? "Allsolve 3D FEM" : "analytical preview"}
@@ -680,13 +831,15 @@ Every sound is synthesised from the floor's vibration modes. No recorded samples
 
 Contents
 --------
-Mono_Dry/<Pace>/   ${VARIATIONS} one-shot variations per pace (${paces}).
+Mono_Dry/<Action>/ ${VARIATIONS} one-shot variations each: ${paces}.
                    48 kHz, 24-bit, MONO, DRY (no reverb). The heel strike is at sample 0, so the
                    sound lines up with the animation event. Tails are trimmed to -70 dB with a 5 ms fade.
                    One gain is shared by the whole set (peak -1 dBFS), so a run is louder than a stroll.
+                   Calibrated volume: ${info.volumeDb} dB (x${info.volume}). Set it on the clips / event so this
+                   surface sits at the right loudness next to other ModalForge packs.
 Loops/             Seamless stereo loop of walking on the spot, room included. Good for crowds and ambience.
 Preview_Wet/       The walk as heard in the app (room + output format). For trailers and reference only.
-manifest.json/csv  Per file: pace, variation, seed, position, duration, peak and RMS level.
+manifest.json/csv  Per file: action, variation, seed, position, duration, peak and RMS level, SPL at 1.5 m.
 
 Why mono and dry? Game engines position the sound in 3D and add the room themselves
 (Unity Reverb Zones / Audio Mixer, Unreal Reverb volumes and submixes). Stereo files or baked
@@ -707,6 +860,7 @@ Unity
 
 Unreal Engine (5.x)
 -------------------
+Easier: export the "Unreal Engine pack" instead. Its import script does all of the below in one step.
 1. Drag the Mono_Dry folder into the Content Browser. Each WAV becomes a Sound Wave.
 2. Make a MetaSound Source: Wave Player fed by "Random Get (WaveAsset:Array)" with No Repeats = 1,
    plus a random pitch of +/-0.7 semitones. Or make a Sound Cue: Random -> Modulator (pitch 0.96-1.04, volume 0.9-1.0) -> Output.
@@ -763,6 +917,121 @@ function openKeyDialog(message) {
   $("#keyDialog").showModal();
 }
 
+// ------------------------------------------------------------------------------- math & provenance
+/** Same-kind material with a different stiffness, for the material-swap sensitivity check. */
+function altMaterial() {
+  const cur = S.cat.materials[S.deckMaterial];
+  const isWood = cur.kind === "wood";
+  return Object.keys(S.cat.materials).find((id) => id !== S.deckMaterial && (S.cat.materials[id].kind === "wood") === isWood && S.cat.materials[id].E !== cur.E) || null;
+}
+
+function relatedBodies() {
+  const base = requestBody();
+  const ss = { ...base, variant: "ss-plate" };
+  const altId = altMaterial();
+  return {
+    ssPlate: ss,
+    ssHalf: { ...ss, thickness: +(S.thickness / 2).toFixed(4) },
+    ssAlt: altId ? { ...ss, deckMaterial: altId } : null,
+    meshFine: { ...base, meshScale: 0.7 },
+    altId,
+  };
+}
+
+async function lookupRaw(body) {
+  if (!body) return null;
+  try {
+    const r = await fetch("api/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return r.ok ? (await r.json()).result : null;
+  } catch { return null; }
+}
+
+async function openMath() {
+  const dlg = $("#mathDialog");
+  if (!dlg.open) dlg.showModal();
+  $("#mathBody").innerHTML = `<p class="hint">Computing the chain…</p>`;
+  const B = relatedBodies();
+  const [ssPlate, ssHalf, ssAlt, meshFine] = await Promise.all([B.ssPlate, B.ssHalf, B.ssAlt, B.meshFine].map(lookupRaw));
+  const w = walker();
+  S.report = buildReport({
+    cat: S.cat, model: S.model, hit: S.hit, status: S.status, surfaceName: S.surface.name,
+    walker: { ...w, shoeId: S.shoe, paceId: S.pace },
+    related: { ssPlate, ssHalf, ssAlt, meshFine, altMaterialId: B.altId },
+  });
+  toggleHelp(null);
+  $("#mathBody").innerHTML = renderHtml(S.report);
+  $("#mathRefine").disabled = S.mathBusy || S.model.source !== "allsolve";
+  $("#mathSS").disabled = $("#mathSens").disabled = S.mathBusy;
+}
+
+/** An Allsolve job for the report. Never replaces the active floor (no applyResult). */
+async function runBackground(body, label) {
+  const line = $("#mathJob");
+  let res;
+  try {
+    res = await fetch("api/simulations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } catch { throw new Error("the ModalForge server is not running"); }
+  const b = await res.json().catch(() => ({}));
+  if (res.status === 401 || res.status === 503) { openKeyDialog(b.detail); throw new Error(b.detail || "Allsolve key missing"); }
+  if (!res.ok) throw new Error(b.detail || "could not start");
+  if (b.status === "done") return b.result;
+  for (;;) {
+    await sleep(2000);
+    let j;
+    try { j = await (await fetch(`api/simulations/${b.jobId}`)).json(); } catch { continue; }
+    line.textContent = `${label}: ${j.stage} · ${Math.round(j.progress * 100)} % · ${Math.floor(j.elapsedS / 60)}:${String(Math.floor(j.elapsedS % 60)).padStart(2, "0")}`;
+    if (j.status === "done") return j.result;
+    if (j.status === "error") throw new Error(j.error || "failed");
+  }
+}
+
+async function mathRun(kind) {
+  if (S.mathBusy) return;
+  S.mathBusy = true;
+  document.querySelectorAll("#mathDialog .math-run").forEach((b) => { b.disabled = true; });
+  const B = relatedBodies(), line = $("#mathJob");
+  const jobs = kind === "ss" ? [[B.ssPlate, "SS validation plate"]]
+    : kind === "sens" ? [[B.ssPlate, "SS validation plate"], [B.ssHalf, "SS plate, half thickness"], ...(B.ssAlt ? [[B.ssAlt, `SS plate, ${S.cat.materials[B.altId].name}`]] : [])]
+    : [[B.meshFine, "Refined mesh (×0.7)"]];
+  try {
+    for (const [body, label] of jobs) {
+      line.textContent = `${label}: starting…`;
+      await runBackground(body, label);
+    }
+    line.textContent = "Done. Report updated.";
+  } catch (e) {
+    line.textContent = `Stopped: ${e.message}`;
+  }
+  S.mathBusy = false;
+  if ($("#mathDialog").open) await openMath();
+}
+
+/** The "?" next to a variable: a small pop-up with a plain-language explanation. */
+function toggleHelp(btn) {
+  const pop = $("#helpPop");
+  const open = btn && btn.getAttribute("aria-expanded") !== "true";
+  document.querySelectorAll("#mathBody .help-q[aria-expanded=true]").forEach((b) => b.setAttribute("aria-expanded", "false"));
+  pop.hidden = !open;
+  if (!open) return;
+  btn.setAttribute("aria-expanded", "true");
+  $("#helpWhat").textContent = btn.dataset.what;
+  $("#helpText").textContent = btn.dataset.help;
+  const r = btn.getBoundingClientRect(), w = pop.offsetWidth, h = pop.offsetHeight;
+  pop.style.left = `${Math.min(Math.max(12, r.left - 12), innerWidth - w - 12)}px`;
+  pop.style.top = `${r.bottom + 8 + h > innerHeight - 12 ? r.top - h - 8 : r.bottom + 8}px`;
+}
+
+function exportReport() {
+  if (!S.report) return;
+  const enc = new TextEncoder();
+  const base = `${fileBase()}_math_report`;
+  const zip = makeZip([
+    { name: `${base}.md`, data: enc.encode(renderMarkdown(S.report)) },
+    { name: `${base}.json`, data: enc.encode(JSON.stringify(S.report, null, 1)) },
+  ]);
+  download(zip, `${base}.zip`);
+}
+
 // ------------------------------------------------------------------------------- tour
 const TOUR = [
   ["#stepSurface", "Pick what you walk on", "Each surface is a real structure: boards, joists and supports, with real material data."],
@@ -792,6 +1061,7 @@ function endTour() { $("#tour").hidden = true; if (spot) spot.style.display = "n
 // ------------------------------------------------------------------------------- wiring
 function wire() {
   $("#simBtn").addEventListener("click", simulate);
+  $("#abSeg").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) switchAB(b.dataset.v); });
   $("#walkBtn").addEventListener("click", walk);
   $("#clearPathBtn").addEventListener("click", () => S.view.clearPath());
   $("#toolSeg").addEventListener("click", (e) => {
@@ -811,6 +1081,7 @@ function wire() {
   $("#dlStep").addEventListener("click", exportStep);
   $("#dlSteps").addEventListener("click", exportSteps);
   $("#dlPack").addEventListener("click", exportPack);
+  $("#dlUnreal").addEventListener("click", exportUnrealPack);
   $("#dlModes").addEventListener("click", exportModes);
   $("#statusPill").addEventListener("click", () => openKeyDialog());
   $("#reloadKeysBtn").addEventListener("click", async () => {
@@ -829,9 +1100,22 @@ function wire() {
   $("#themeBtn").addEventListener("click", () => {
     const t = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     document.documentElement.dataset.theme = t; store.set("mf-theme", t);
-    renderModeStrip(); if (S.lastStep) showSound(S.lastStep.mixed, S.lastStep.r);
+    renderModeStrip(); renderCompare(); if (S.lastStep) showSound(S.lastStep.mixed, S.lastStep.r);
   });
   $("#tourBtn").addEventListener("click", startTour);
+  $("#mathBtn").addEventListener("click", openMath);
+  $("#mathExport").addEventListener("click", exportReport);
+  $("#mathSS").addEventListener("click", () => mathRun("ss"));
+  $("#mathSens").addEventListener("click", () => mathRun("sens"));
+  $("#mathRefine").addEventListener("click", () => mathRun("refine"));
+  $("#mathDialog").addEventListener("click", (e) => {
+    const q = e.target.closest(".help-q");
+    if (q) { e.preventDefault(); toggleHelp(q); } else if (!e.target.closest("#helpPop")) toggleHelp(null);
+  });
+  $("#mathBody").addEventListener("scroll", () => toggleHelp(null), { passive: true });
+  // Esc closes the pop-up first, the dialog on a second press.
+  $("#mathDialog").addEventListener("cancel", (e) => { if (!$("#helpPop").hidden) { e.preventDefault(); toggleHelp(null); } });
+  $("#mathDialog").addEventListener("close", () => toggleHelp(null));
   $("#tourNext").addEventListener("click", () => { if (++tourIdx >= TOUR.length) endTour(); else showTour(); });
   $("#tourSkip").addEventListener("click", endTour);
   addEventListener("resize", () => { if (!$("#tour").hidden) showTour(); });
@@ -844,6 +1128,10 @@ function wire() {
     if (e.key === "q" || e.key === "Q") S.view.rotateListener(Math.PI / 12);
     if (e.key === "e" || e.key === "E") S.view.rotateListener(-Math.PI / 12);
     if (e.key === "l" || e.key === "L") $("#loopBtn").click();
+    if (e.key === "d" || e.key === "D") { // cycle the ground debris
+      const btns = [...$("#debrisChips").querySelectorAll("button")];
+      btns[(btns.findIndex((b) => b.dataset.v === S.debris) + 1) % btns.length]?.click();
+    }
   });
   drawSpectrum($("#spectrum"), null);
 }

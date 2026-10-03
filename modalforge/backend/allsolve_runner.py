@@ -10,48 +10,91 @@ import io
 import json
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
 from .model import (
-    F_MAX_HZ, NUM_MODES, PROBE_NX, PROBE_NY, ROOT, FloorSpec, joist_positions,
+    ROOT, FloorSpec, joist_positions,
     load_catalog, mesh_size_max, probe_points, wood_stiffness_matrix,
 )
-from .settings import make_client
+from .settings import SDK_VERSION, credentials, make_client
 
 Progress = Callable[[str, float, str | None], None]  # (stage, fraction 0..1, log line)
 TOL = 1e-4
-NODE_TYPE = "CORES_4_64GB"
+DEFAULT_NODE_TYPE = "CORES_4_64GB"
+OUTPUT_THREADS = 8  # parallel requests when registering probe outputs
+
+
+def node_type() -> str:
+    """Allsolve CPU node for mesh and solve: MODALFORGE_NODE_TYPE in the environment or .env, e.g. CORES_8_128GB."""
+    return credentials.node_type or DEFAULT_NODE_TYPE
+
+
+class StageClock:
+    """Wall time per pipeline stage [s]. The dict is shared with the job panel, so it fills in live."""
+
+    def __init__(self, timings: dict | None = None) -> None:
+        self.timings = timings if timings is not None else {}
+        self.t0 = time.time()
+
+    def add(self, name: str, seconds: float) -> None:
+        self.timings[name] = round(self.timings.get(name, 0.0) + seconds, 1)
+
+    @contextmanager
+    def stage(self, name: str):
+        start = time.time()
+        try:
+            yield
+        finally:
+            self.add(name, time.time() - start)
+
+    def total(self) -> None:
+        self.timings["total"] = round(time.time() - self.t0, 1)
 
 
 def _num(v: float) -> str:
     return repr(float(v))
 
 
-def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dict:
+def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path, timings: dict | None = None) -> dict:
     import allsolve
 
     cat = load_catalog()
     started = time.time()
-    progress("Connecting to Allsolve", 0.02, None)
-    client = make_client()
+    clock = StageClock(timings)
+    node = node_type()
+    cpu = getattr(allsolve.CPU, node, None)
+    if cpu is None:
+        raise ValueError(f"Unknown MODALFORGE_NODE_TYPE '{node}'. Options: {', '.join(c.name for c in allsolve.CPU)}")
+    nx, ny = spec.probe_grid
+    progress("Connecting to Allsolve", 0.02, f"Quality '{spec.quality}': mesh for {spec.f_max:.0f} Hz, "
+             f"{spec.num_modes} modes, {nx}x{ny} probes, node {node}")
+    with clock.stage("connect"):
+        client = make_client()
+        project_key = client.is_project_api_key()
 
-    if client.is_project_api_key():
+    if project_key:
         # Project-scoped key: may not create projects, so reuse the key's project, cleared first.
-        project = client.get_project_from_token()
+        with clock.stage("connect"):
+            project = client.get_project_from_token()
         progress("Clearing the key's project", 0.04, f"Project key: reusing project {project.id}")
-        _reset_project(project)
+        with clock.stage("reset"):
+            _reset_project(project)
     else:
-        project = client.create_project(
-            name=f"ModalForge · {spec.surface_id} · {spec.cache_key()[:6]}",
-            description="Footstep sound floor: eigenmode analysis (ModalForge hackathon demo)",
-        )
+        with clock.stage("connect"):
+            project = client.create_project(
+                name=f"ModalForge · {spec.surface_id} · {spec.quality} · {spec.cache_key()[:6]}",
+                description="Footstep sound floor: eigenmode analysis (ModalForge hackathon demo)",
+            )
     project_url = None
     try:
         project_url = client.get_url(project)
     except Exception:
         pass
     progress("Project created", 0.06, f"Project {project.id}")
+    setup_t0 = time.time()
 
     # ---- variables -------------------------------------------------------------------------
     project.create_variables([
@@ -74,7 +117,9 @@ def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dic
             alignment=allsolve.CadAlignment.CORNER,
         )
     gb.build(print_logs=False, on_error=allsolve.OnError.RAISE)
-    progress("Geometry built", 0.16, f"Deck + {len(xs)} joists")
+    clock.add("geometry", time.time() - setup_t0)
+    progress("Geometry built", 0.16, f"Deck + {len(xs)} joists ({clock.timings['geometry']:.0f} s)")
+    setup_t0 = time.time()
 
     # ---- regions ---------------------------------------------------------------------------
     Lx, Ly, t, h = spec.Lx, spec.Ly, spec.thickness, spec.joist_height
@@ -82,7 +127,24 @@ def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dic
         name="deck", entity_type=allsolve.Region.VOLUME,
         bounding_box=((-TOL, -TOL, -TOL), (Lx + TOL, Ly + TOL, t + TOL)),
     )
-    if spec.has_joists:
+    if spec.variant == "ss-plate":
+        # Validation plate: simple support approximated in 3D by pinning the four bottom edges (z = 0).
+        # Rotation about the edge stays free, so the plate behaves as simply supported for small t / L.
+        edges = []
+        for name, lo, hi in [
+            ("bottom_edge_x0", (-TOL, -TOL, -TOL), (TOL, Ly + TOL, TOL)),
+            ("bottom_edge_x1", (Lx - TOL, -TOL, -TOL), (Lx + TOL, Ly + TOL, TOL)),
+            ("bottom_edge_y0", (-TOL, -TOL, -TOL), (Lx + TOL, TOL, TOL)),
+            ("bottom_edge_y1", (-TOL, Ly - TOL, -TOL), (Lx + TOL, Ly + TOL, TOL)),
+        ]:
+            edges.append(project.create_region_rule(
+                name=name, entity_type=allsolve.Region.CURVE, bounding_box=(lo, hi)))
+        supports = project.create_region_computed(
+            name="supports", entity_type=allsolve.Region.CURVE,
+            operation=allsolve.RegionOperation.UNION, source_regions=[e.id for e in edges],
+        )
+        boundary = "Bare deck, simply supported: four bottom edges (z = 0) pinned (u = 0 on the edge lines)"
+    elif spec.has_joists:
         joists = project.create_region_rule(
             name="joists", entity_type=allsolve.Region.VOLUME,
             bounding_box=((-TOL, -TOL, -h - TOL), (Lx + TOL, Ly + TOL, TOL)),
@@ -100,6 +162,7 @@ def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dic
             name="supports", entity_type=allsolve.Region.SURFACE,
             operation=allsolve.RegionOperation.UNION, source_regions=[end0.id, end1.id],
         )
+        boundary = "Joist end faces (y = 0 and y = Ly) clamped (u = 0); deck edges free"
     else:
         sides = []
         for name, lo, hi in [
@@ -114,6 +177,7 @@ def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dic
             name="supports", entity_type=allsolve.Region.SURFACE,
             operation=allsolve.RegionOperation.UNION, source_regions=[s.id for s in sides],
         )
+        boundary = "Slab: all four side faces clamped (u = 0)"
 
     # ---- materials -------------------------------------------------------------------------
     progress("Assigning materials", 0.20, None)
@@ -136,23 +200,27 @@ def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dic
     solid.add_interactions([allsolve.Interaction.SolidMechanicsClamp(name="Supports", target=supports)])
 
     # ---- mesh ------------------------------------------------------------------------------
-    h_max = mesh_size_max(spec, cat)
-    progress("Meshing", 0.26, f"Max element size {h_max * 1000:.0f} mm")
+    h_max = mesh_size_max(spec, cat) * spec.mesh_scale
     mesh = project.create_mesh(allsolve.MeshSettings(
         name="Floor mesh",
         mesh_size_max=h_max,
-        node_type=getattr(allsolve.CPU, NODE_TYPE).value,
+        node_type=cpu.value,
         max_run_time_minutes=20,
     ))
+    clock.add("setup", time.time() - setup_t0)
+    progress("Meshing", 0.26, f"Max element size {h_max * 1000:.0f} mm")
     mesh.start()
-    _follow(mesh, progress, "Meshing", 0.26, 0.45)
+    _follow(mesh, progress, "Meshing", 0.26, 0.40, clock, "mesh")
     if mesh.get_status() != allsolve.Job.SUCCESS:
         reason = _safe(lambda: mesh.get_status_reason())
         raise RuntimeError(f"Meshing failed ({mesh.get_status()}{', ' + str(reason) if reason else ''})")
     metrics = _mesh_metrics(mesh)
+    if metrics:
+        progress("Meshing", 0.40, f"Mesh: {metrics.get('nodes')} nodes, {metrics.get('elements')} elements")
 
     # ---- simulation ------------------------------------------------------------------------
-    progress("Setting up eigenmode solve", 0.47, f"{NUM_MODES} modes requested")
+    setup_t0 = time.time()
+    progress("Setting up eigenmode solve", 0.42, f"{spec.num_modes} modes requested")
     sim = project.create_simulation_eigenmode(
         name="Floor eigenmodes",
         description="Natural frequencies and mode shapes of the floor",
@@ -160,49 +228,71 @@ def run_floor_modes(spec: FloorSpec, progress: Progress, debug_dir: Path) -> dic
         solver_mode=allsolve.SolverMode.DIRECT,
         mesh=mesh.id,
         physics_set=physics_set,
-        num_requested_eigenmodes=str(NUM_MODES),
+        num_requested_eigenmodes=str(spec.num_modes),
         target_eigenfrequency="0",
     )
-    outputs = [
-        allsolve.Output.Eigenfrequencies(name="Eigenfrequencies"),
-        allsolve.Output.FieldOutput(name="u", expression="u", field_output_skin_only=True),
-    ]
+    # Only the eigenfrequencies and the probe values are read back. A full-field output ("u" on the
+    # skin, every mode) cost minutes of output processing and was never used.
+    outputs = [allsolve.Output.Eigenfrequencies(name="Eigenfrequencies")]
     z_mid = t / 2
     for i, j, x, y in probe_points(spec):
         outputs.append(allsolve.Output.ValueOutput(
             name=f"w_{i:02d}_{j:02d}",
             expression=f"interpolate(reg.deck, compz(u), [{_num(x)}, {_num(y)}, {_num(z_mid)}])",
         ))
-    sim.add_outputs(outputs)
-    _safe(lambda: (sim.set_runtime(allsolve.Runtime(node_type=getattr(allsolve.CPU, NODE_TYPE))), sim.save()))
+    # add_outputs() makes one HTTP request per output, in sequence (~0.17 s each: 384 probes ≈ 65 s).
+    # The outputs are independent, so send them in parallel chunks. A Client serialises its requests
+    # behind a lock, so each worker binds its own client to its thread.
+    def add_chunk(chunk):
+        with make_client().in_thread():
+            sim.add_outputs(chunk)
 
-    progress("Solving on Allsolve cloud", 0.50, None)
+    chunks = [outputs[k::OUTPUT_THREADS] for k in range(OUTPUT_THREADS)]
+    with ThreadPoolExecutor(max_workers=OUTPUT_THREADS) as pool:
+        list(pool.map(add_chunk, [c for c in chunks if c]))
+    _safe(lambda: (sim.set_runtime(allsolve.Runtime(node_type=cpu)), sim.save()))
+    clock.add("solve_setup", time.time() - setup_t0)
+
+    progress("Solving on Allsolve cloud", 0.45, None)
     sim.start()
-    _follow(sim, progress, "Solving on Allsolve cloud", 0.50, 0.92)
+    _follow(sim, progress, "Solving on Allsolve cloud", 0.45, 0.92, clock, "solve")
     if sim.get_status() != allsolve.Job.SUCCESS:
-        raise RuntimeError(f"Eigenmode solve failed ({sim.get_status()}). See the Allsolve project logs.")
+        reason = _safe(lambda: sim.get_status_reason())
+        raise RuntimeError(f"Eigenmode solve failed ({sim.get_status()}{', ' + str(reason) if reason else ''}). "
+                           "See the Allsolve project logs.")
 
     # ---- results ---------------------------------------------------------------------------
     progress("Reading results", 0.94, None)
-    modes = _extract_modes(sim, spec, debug_dir)
-    progress("Done", 1.0, f"{len(modes)} modes")
+    with clock.stage("extract"):
+        modes, raw_freqs = _extract_modes(sim, spec, debug_dir)
+    clock.total()
+    progress("Done", 1.0, f"{len(modes)} modes · " + ", ".join(f"{k} {v:.0f} s" for k, v in clock.timings.items()))
 
     return {
         "source": "allsolve",
         "spec": _spec_public(spec),
-        "grid": {"nx": PROBE_NX, "ny": PROBE_NY, "Lx": spec.Lx, "Ly": spec.Ly, "layout": "cell-centred"},
+        "grid": {"nx": nx, "ny": ny, "Lx": spec.Lx, "Ly": spec.Ly, "layout": "cell-centred"},
         "joists": xs,
         "modes": modes,
+        "rawEigenfrequencies": raw_freqs,
         "meta": {
+            "variant": spec.variant,
+            "boundary": boundary,
+            "meshScale": spec.mesh_scale,
+            "quality": spec.quality,
+            "numRequested": spec.num_modes,
+            "sdkVersion": SDK_VERSION,
+            "simulationName": "Floor eigenmodes",
             "projectId": project.id,
             "projectUrl": project_url,
             "simulationId": sim.id,
             "meshMaxSize": h_max,
             "mesh": metrics,
-            "fMaxHz": F_MAX_HZ,
+            "fMaxHz": spec.f_max,
             "elapsedS": round(time.time() - started, 1),
+            "timings": dict(clock.timings),
             "computedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "nodeType": NODE_TYPE,
+            "nodeType": node,
         },
     }
 
@@ -214,6 +304,14 @@ def _reset_project(project) -> None:
     """Delete a project's contents in dependency order (Allsolve SDK skill: project workflow)."""
     import allsolve
 
+    # A job left running (server restarted mid-solve) blocks deletion: abort it and wait.
+    jobs = list(project.get_simulations()) + list(project.get_meshes())
+    for job in jobs:
+        if _safe(lambda: job.is_running(refresh_delay_s=0)):
+            _safe(job.abort)
+    deadline = time.time() + 90
+    while time.time() < deadline and any(_safe(lambda: j.is_running(refresh_delay_s=0)) for j in jobs):
+        time.sleep(3)
     for sim in project.get_simulations():
         sim.delete()
     for mesh in project.get_meshes():
@@ -245,19 +343,36 @@ def _elasticity(allsolve, mat: dict, cat: dict, orthotropic: bool):
     )
 
 
-def _follow(job, progress: Progress, stage: str, f0: float, f1: float) -> None:
-    """Poll a cloud job, stream new log lines to the UI, and creep the progress bar."""
-    t0 = time.time()
+# Job states, grouped into what the user waits for: a free node, the computation, the output files.
+_PHASE = {"submitted": "queue", "starting": "queue", "queued": "queue", "running": "run",
+          "processing_output": "output", "aborting": "run", "failing": "run"}
+_PHASE_SHARE = {"queue": (0.0, 0.15), "run": (0.15, 0.85), "output": (0.85, 1.0)}
+
+
+def _follow(job, progress: Progress, stage: str, f0: float, f1: float, clock: StageClock, prefix: str) -> None:
+    """Poll a cloud job and stream its log lines. Time per job state goes to the clock as
+    <prefix>_queue / _run / _output. The bar moves by state and creeps within each one."""
+    t_phase, phase = time.time(), "queue"
     while job.is_running(refresh_delay_s=2):
+        status = job.get_status()
+        status = str(getattr(status, "value", status) or "submitted").lower()
+        now_phase = _PHASE.get(status, phase)
+        now = time.time()
+        if now_phase != phase:
+            clock.add(f"{prefix}_{phase}", now - t_phase)
+            progress(stage, f0, f"{prefix}: {phase} took {clock.timings[prefix + '_' + phase]:.0f} s, now {now_phase}")
+            t_phase, phase = now, now_phase
         buf = io.StringIO()
         _safe(lambda: job.print_new_loglines(buf))
         lines = [ln.strip() for ln in buf.getvalue().splitlines() if ln.strip()]
-        frac = f0 + (f1 - f0) * (1 - math.exp(-(time.time() - t0) / 60))
+        a, b = _PHASE_SHARE[phase]
+        frac = f0 + (f1 - f0) * (a + (b - a) * (1 - math.exp(-(now - t_phase) / 60)))
         if lines:
             for ln in lines[-5:]:
                 progress(stage, frac, ln)
         else:
             progress(stage, frac, None)
+    clock.add(f"{prefix}_{phase}", time.time() - t_phase)  # the state the job finished in
     buf = io.StringIO()
     _safe(lambda: job.print_new_loglines(buf))
     for ln in buf.getvalue().splitlines()[-5:]:
@@ -295,26 +410,36 @@ def _extract_modes(sim, spec: FloorSpec, debug_dir: Path) -> list[dict]:
                 return cand
         return name
 
-    probe_headers = {(i, j): header_for(f"w_{i:02d}_{j:02d}") for j in range(PROBE_NY) for i in range(PROBE_NX)}
+    nx, ny = spec.probe_grid
+    probe_headers = {(i, j): header_for(f"w_{i:02d}_{j:02d}") for j in range(ny) for i in range(nx)}
     modes = []
+    raw: list[dict] = []  # every returned eigenfrequency, with the reason it was dropped (if it was)
     for k, s in enumerate(mode_steps):
         f = freqs[k] if k < len(freqs) else None
-        if f is None or not math.isfinite(f) or f < 1.0:
+        entry = {"index": k, "f": f if (f is not None and math.isfinite(f)) else None, "kept": False}
+        raw.append(entry)
+        if f is None or not math.isfinite(f):
+            entry["dropped"] = "no frequency value returned"
+            continue
+        if f < 1.0:
+            entry["dropped"] = "below 1 Hz: rigid-body / zero-energy mode"
             continue
         shape = []
-        for j in range(PROBE_NY):
-            for i in range(PROBE_NX):
+        for j in range(ny):
+            for i in range(nx):
                 v = od.get_value_at(0, s, probe_headers[(i, j)])
                 shape.append(float(v) if v is not None else 0.0)
         peak = max((abs(v) for v in shape), default=0.0)
         if peak <= 0:
+            entry["dropped"] = "zero vertical displacement at every probe point (in-plane mode)"
             continue
+        entry["kept"] = True
         modes.append({"f": f, "shape": [round(v / peak, 5) for v in shape]})
     modes.sort(key=lambda m: m["f"])
     if not modes:
         raise RuntimeError("Simulation finished but no mode data could be read. See cache/last_output_headers.json.")
     _safe(od.clean_cache)
-    return modes
+    return modes, raw
 
 
 def _mesh_metrics(mesh) -> dict | None:
